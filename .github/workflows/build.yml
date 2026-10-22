@@ -1,0 +1,57 @@
+name: Build Custom Buffers Android
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r28c
+
+      - name: Configure
+        run: >-
+          xmake f -y -p android -a arm64-v8a -m release
+          --ndk=${{ steps.ndk.outputs.ndk-path }} --ndk_sdkver=28
+
+      - name: Build
+        run: xmake -y CustomBuffers
+
+      - name: Package
+        run: |
+          VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dist
+          cp build/android/arm64-v8a/release/CustomBuffers.levipack "dist/CustomBuffers-${VERSION}.levipack"
+          cp "dist/CustomBuffers-${VERSION}.levipack" "dist/CustomBuffers-${VERSION}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CustomBuffers-Android
+          path: |
+            build/android/arm64-v8a/release/CustomBuffers.so
+            dist/CustomBuffers-*.levipack
+            dist/CustomBuffers-*.zip
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/CustomBuffers-*.zip
+            dist/CustomBuffers-*.levipack

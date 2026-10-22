@@ -1,0 +1,19 @@
+{
+  "name": "ScreenBuffer",
+  "register_slot": 3,
+  "binding_slot": 3,
+  "type": "texture2D",
+  "precision": "lowp",
+  "access": "undefined",
+  "texture_format": "",
+  "default_texture": "white",
+  "unordered_access": false,
+  "slot_count": 1,
+  "texture_path": "",
+  "unknown": 0,
+  "sampler_state": {
+    "filter": "Bilinear",
+    "wrapping": "Clamp"
+  },
+  "custom_type_info": {}
+}

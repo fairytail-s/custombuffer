@@ -1,0 +1,7 @@
+build/
+dist/
+*.o
+*.so
+.idea/
+.vscode/
+.xmake

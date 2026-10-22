@@ -1,0 +1,19 @@
+{
+  "name": "SceneDepthBuffer",
+  "register_slot": 4,
+  "binding_slot": 4,
+  "type": "texture2D",
+  "precision": "highp",
+  "access": "undefined",
+  "texture_format": "",
+  "default_texture": "white",
+  "unordered_access": false,
+  "slot_count": 1,
+  "texture_path": "",
+  "unknown": 0,
+  "sampler_state": {
+    "filter": "Point",
+    "wrapping": "Clamp"
+  },
+  "custom_type_info": {}
+}
