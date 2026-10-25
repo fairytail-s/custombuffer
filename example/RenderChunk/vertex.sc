@@ -24,7 +24,7 @@ void main() {
   vec4 color;
   #ifdef RENDER_AS_BILLBOARDS
     worldPos += vec3(0.5, 0.5, 0.5);
-    vec3 viewDir = normalize(worldPos - ViewPositionAndTime.xyz);
+    vec3 viewDir = normalize(worldPos);
     vec3 boardPlane = normalize(vec3(viewDir.z, 0.0, -viewDir.x));
     worldPos -= (viewDir.yzx*boardPlane.zxy - viewDir.zxy*boardPlane.yzx)*(a_color0.z - 0.5) + boardPlane*(a_color0.x - 0.5);
     color = vec4_splat(1.0);
@@ -32,7 +32,7 @@ void main() {
     color = a_color0;
   #endif
 
-    vec3 modelCamPos = (ViewPositionAndTime.xyz - worldPos);
+    vec3 modelCamPos = (-worldPos);
     float camDis = length(modelCamPos);
     float fogIntensity = calculateFogIntensityFaded(camDis, FogAndDistanceControl.z, FogAndDistanceControl.x, FogAndDistanceControl.y, RenderChunkFogAlpha.x);
     vec4 fog = vec4(FogColor.rgb, fogIntensity);
@@ -41,6 +41,7 @@ void main() {
     if (a_color0.a < 0.95) {
       color.a = mix(a_color0.a, 1.0, clamp((camDis / FogAndDistanceControl.w), 0.0, 1.0));
     };
+    // https://github.com/Rinloid/reflective-vanilla-rd/tree/main
     float water = 0.0;
     if (a_color0.r != a_color0.g || a_color0.g != a_color0.b) { water = 1.0; }
     v_water = water;

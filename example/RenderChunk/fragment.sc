@@ -17,15 +17,13 @@ $input v_texcoord0, v_color0, v_fog, v_lightmapUV, v_water
 #endif
 
 // water shoreline
-#define FOAM_NEAR 0.05
-#define FOAM_FAR 512.0
 #define FOAM_WIDTH 0.6
 #define FOAM_COLOR vec3(0.55, 0.75, 0.75)
 
-// depth buffer (0..1) -> blocks
+// depth buffer (0..1) -> view-space distance in blocks.
 float sceneDepthLinear(float d) {
   float ndc = d * 2.0 - 1.0;
-  return (2.0 * FOAM_NEAR * FOAM_FAR) / (FOAM_FAR + FOAM_NEAR - ndc * (FOAM_FAR - FOAM_NEAR));
+  return u_proj[3][2] / (ndc + u_proj[2][2]);
 }
 
 void main() {
@@ -50,9 +48,7 @@ void main() {
         vec2 depthUV = gl_FragCoord.xy / vec2(textureSize(s_SceneDepthBuffer, 0));
         float behind = sceneDepthLinear(texture2D(s_SceneDepthBuffer, depthUV).r);
         float thickness = max(behind - sceneDepthLinear(gl_FragCoord.z), 0.0);
-
         float foam = 1.0 - smoothstep(0.0, FOAM_WIDTH, thickness);
-
         diffuse.rgb = mix(diffuse.rgb, FOAM_COLOR, foam);
         diffuse.a = max(diffuse.a, foam);
       }
