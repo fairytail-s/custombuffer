@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +55,28 @@ constexpr GLenum GL_BACK = 0x0405, GL_SAMPLES = 0x80A9;
 constexpr GLenum GL_RGBA = 0x1908, GL_UNSIGNED_BYTE = 0x1401;
 constexpr GLenum GL_READ_BUFFER = 0x0C02, GL_COLOR_ATTACHMENT0_ENUM = 0x8CE0;
 constexpr GLenum GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE = 0x8CD3, GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER = 0x8CD4;
+constexpr GLenum GL_DEPTH_FUNC = 0x0B74, GL_DEPTH_WRITEMASK = 0x0B72, GL_DEPTH_TEST = 0x0B71, GL_DEPTH_CLEAR_VALUE = 0x0B73;
+constexpr GLenum GL_POLYGON_OFFSET_FILL = 0x8037, GL_LESS = 0x0201;
+constexpr GLenum GL_BLEND = 0x0BE2, GL_COLOR_WRITEMASK = 0x0C23, GL_COLOR_CLEAR_VALUE = 0x0C22;
 constexpr int kEglDraw = 0x3059;
+// ---- shadow maps ----
+// Three maps, the same split Iris/OptiFine use for transparent shadows:
+//   s_ShadowMap    depth of OPAQUE casters only                       (Iris: shadowtex1)
+//   s_ShadowAll    depth of ALL casters, opaque + transparent         (Iris: shadowtex0)
+//   s_ShadowColor  RGBA written by the nearest of those casters       (Iris: shadowcolor0)
+// A program that declares "ShadowPass" is an opaque caster: drawn into s_ShadowMap. A program that declares
+// "ShadowTransparentPass" is a transparent caster: it is drawn into the all-casters map only (its fragment shader
+// writes the colour). The all-casters depth starts as a copy of the opaque depth the first time a transparent
+// caster is drawn in a frame, so the opaque casters are not drawn a third time.
+// Every draw whose program declares the uniform "ShadowPass" is drawn a second time into a depth-only
+// texture while that uniform is 1. Programs that declare the sampler "s_ShadowMap" get the finished map
+// of the PREVIOUS frame (double buffered), so receivers never read a half-built map.
+// Resolution comes from the material: the uniform "ShadowRes" (vec4: x = texels per side, y = depth bits, z/w unused) of the caster
+// program, read once per frame. The map is recreated whenever it changes. Without that uniform: the default.
+constexpr int kShadowSize = 2048;                 // default texels per side
+constexpr int kShadowSizeMin = 256, kShadowSizeMax = 4096;
+constexpr GLenum kShadowFormat = GL_DEPTH_COMPONENT16;   // default (ShadowRes.y unset / 0); ShadowRes.y = 24 or 32 picks DEPTH_COMPONENT24 / 32F
+constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 4.0f;  // slope-scaled depth bias while casting
 constexpr int kTrackedUnits = 32;
 constexpr unsigned kRevalidateFrames = 60;
 constexpr unsigned kVerifyMask = 1023;
@@ -78,6 +100,7 @@ struct Gl {
     GLenum (*CheckFramebufferStatus)(GLenum);
     GLint (*GetUniformLocation)(GLuint, const char*);
     void (*GetUniformiv)(GLuint, GLint, GLint*);
+    void (*GetUniformfv)(GLuint, GLint, float*);
     void (*GetIntegerv)(GLenum, GLint*);
     GLboolean (*IsEnabled)(GLenum);
     void (*Enable)(GLenum);
@@ -99,6 +122,18 @@ struct Gl {
     void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
     void (*RenderbufferStorageMultisample)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
     void (*ReadBuffer)(GLenum);
+    void (*Uniform4f)(GLint, float, float, float, float);
+    void (*Viewport)(GLint, GLint, GLsizei, GLsizei);
+    void (*Clear)(GLbitfield);
+    void (*ClearDepthf)(float);
+    void (*DepthMask)(GLboolean);
+    void (*DepthFunc)(GLenum);
+    void (*DrawBuffers)(GLsizei, const GLenum*);
+    void (*PolygonOffset)(float, float);
+    void (*GetFloatv)(GLenum, float*);
+    void (*ClearColor)(float, float, float, float);
+    void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+    void (*GetBooleanv)(GLenum, GLboolean*);
 };
 Gl real{};
 
@@ -139,6 +174,36 @@ struct Own {
 };
 struct Units {
     GLint unit[kKinds] = {-1, -1};
+    GLint shadowSampler = -1;   // texture unit of s_ShadowMap, -1 if the program has none
+    GLint shadowPassLoc = -1;   // location of the "ShadowPass" uniform, -1 if the program is not a caster
+    GLint shadowResLoc = -1;   // location of the "ShadowRes" uniform (vec4: x = shadow map resolution, y = depth bits, z/w unused), -1 if absent
+    GLint transPassLoc = -1;    // location of "ShadowTransparentPass", -1 if the program is not a transparent caster
+    GLint allSampler = -1;      // texture unit of s_ShadowAll, -1 if the program has none
+    GLint colorSampler = -1;    // texture unit of s_ShadowColor, -1 if the program has none
+    // chunk culling (see cullsOutsideMap): locations of u_model / ShadowCull / GameTimeOfDay, -1 if the program has none
+    GLint modelLoc = -1, cullLoc = -1, timeLoc = -1;
+    struct Cull {               // refreshed once per frame per program
+        unsigned frame = 0xFFFFFFFFu;
+        bool on = false;
+        float radius = 0.0f, limit = 0.0f, lx = 0.0f, ly = 1.0f;
+    };
+    mutable Cull cull;
+};
+struct Shadow {
+    GLuint tex[2] = {0, 0};
+    GLuint fbo[2] = {0, 0};
+    int write = 0;              // index being written this frame; the other one is read by receivers
+    int size = 0;               // texels per side of the current (or last attempted) maps
+    unsigned sizeFrame = 0xFFFFFFFFu;   // frame in which the material resolution was last read
+    int wantedSize = 0;         // resolution the material asked for in that frame
+    GLenum format = kShadowFormat, wantedFormat = kShadowFormat;   // depth format of the maps, and the one the material asked for
+    unsigned castsSinceCreate = 0;   // caster draws since the maps were created (GL errors are only drained for the first few)
+    bool created = false, failed = false, readValid = false;
+    unsigned clearedFrame = 0xFFFFFFFFu;
+    // all-casters map: depth + colour, double buffered like the opaque map, created when the first transparent caster draws
+    GLuint allTex[2] = {0, 0}, colorTex[2] = {0, 0}, allFbo[2] = {0, 0};
+    bool allCreated = false, allFailed = false, allReadValid = false;
+    unsigned allFrame = 0xFFFFFFFFu;    // frame in which the all-casters map was started (depth copied, colour cleared)
 };
 struct Probe {
     bool known = false, ok = false;
@@ -166,6 +231,7 @@ struct State {
     unsigned failedFrames[kKinds] = {}, retries[kKinds] = {};
     std::unordered_map<GLuint, Units> unitsOf;
     Own own[kKinds];
+    Shadow sh;
     GLuint fallback[kKinds] = {0, 0};
     GLuint lastProgram = 0;
     const Units* lastUnits = nullptr;
@@ -462,6 +528,11 @@ struct Bind {
     GLint prevTexture[kKinds] = {0, 0};
     GLint prevActive = 0;
     GLint current = 0;
+    int shadowUnit = -1;
+    GLint prevShadow = 0;
+    int allUnit = -1, colorUnit = -1;
+    GLint prevAll = 0, prevColor = 0;
+    GLint program = 0;
 };
 
 GLint lookupUnit(GLuint program, Kind kind) {
@@ -500,6 +571,28 @@ const Units* unitsFor(State& st, GLuint program) {
     if (known == st.unitsOf.end()) {
         Units u;
         for (int k = 0; k < kKinds; ++k) u.unit[k] = lookupUnit(program, static_cast<Kind>(k));
+        u.shadowPassLoc = real.GetUniformLocation(program, "ShadowPass");
+        u.shadowResLoc = real.GetUniformLocation(program, "ShadowRes");
+        const GLint sloc = real.GetUniformLocation(program, "s_ShadowMap");
+        if (sloc >= 0) {
+            GLint unit = -1;
+            real.GetUniformiv(program, sloc, &unit);
+            if (unit >= 0 && unit < kTrackedUnits) u.shadowSampler = unit;
+        }
+        u.transPassLoc = real.GetUniformLocation(program, "ShadowTransparentPass");
+        auto samplerUnit = [&](const char* name) {
+            const GLint loc = real.GetUniformLocation(program, name);
+            GLint unit = -1;
+            if (loc >= 0) real.GetUniformiv(program, loc, &unit);
+            return (unit >= 0 && unit < kTrackedUnits) ? unit : -1;
+        };
+        u.allSampler = samplerUnit("s_ShadowAll");
+        u.colorSampler = samplerUnit("s_ShadowColor");
+        u.cullLoc = real.GetUniformLocation(program, "ShadowCull");
+        u.timeLoc = real.GetUniformLocation(program, "GameTimeOfDay");
+        u.modelLoc = real.GetUniformLocation(program, "u_model");
+        if (u.modelLoc < 0) u.modelLoc = real.GetUniformLocation(program, "u_model[0]");
+        if (u.cullLoc < 0 || u.timeLoc < 0) u.modelLoc = -1;   // not a culling program: never query the model matrix
         known = st.unitsOf.emplace(program, u).first;
     }
     st.lastProgram = program;
@@ -512,7 +605,7 @@ Bind bindBuffers(State& st, GLint program) {
     if (program <= 0) return bind;
 
     const Units* units = unitsFor(st, static_cast<GLuint>(program));
-    if (units->unit[0] < 0 && units->unit[1] < 0) return bind;
+    if (units->unit[0] < 0 && units->unit[1] < 0 && units->shadowSampler < 0 && units->allSampler < 0 && units->colorSampler < 0) return bind;
 
     bool havePrevActive = false;
     for (int k = 0; k < kKinds; ++k) {
@@ -539,12 +632,48 @@ Bind bindBuffers(State& st, GLint program) {
         real.BindTexture(GL_TEXTURE_2D, source);
         bind.unit[k] = unit;
     }
+
+    // shadow maps: last frame's finished maps; until they exist a white texture reads as depth 1.0 (= lit, uncoloured)
+    auto bindExtra = [&](GLint unit, GLuint wanted, int& unitOut, GLint& prevOut) {
+        if (unit < 0) return;
+        const GLuint source = wanted ? wanted : fallbackTexture(st, kDepth);
+        if (!source) return;
+        if (!havePrevActive) {
+            bind.prevActive = bind.current = trackedActive(st);
+            havePrevActive = true;
+        }
+        prevOut = trackedTexture(st, unit);
+        if (bind.current != unit) {
+            real.ActiveTexture(GL_TEXTURE0 + unit);
+            bind.current = unit;
+        }
+        real.BindTexture(GL_TEXTURE_2D, source);
+        unitOut = unit;
+    };
+    const int rd = st.sh.write ^ 1;
+    bindExtra(units->shadowSampler, st.sh.readValid ? st.sh.tex[rd] : 0, bind.shadowUnit, bind.prevShadow);
+    // Without transparent casters in that frame the all-casters depth IS the opaque depth, so hand out the opaque map
+    // (a white texture here would read as "nothing in the way" and wipe out every opaque shadow). Colour: white.
+    const bool allOk = st.sh.readValid && st.sh.allReadValid;
+    bindExtra(units->allSampler, allOk ? st.sh.allTex[rd] : (st.sh.readValid ? st.sh.tex[rd] : 0), bind.allUnit, bind.prevAll);
+    bindExtra(units->colorSampler, allOk ? st.sh.colorTex[rd] : 0, bind.colorUnit, bind.prevColor);
     return bind;
 }
 
 void unbindBuffers(const Bind& bind) {
-    if (bind.unit[kScreen] < 0 && bind.unit[kDepth] < 0) return;
+    if (bind.unit[kScreen] < 0 && bind.unit[kDepth] < 0 && bind.shadowUnit < 0 && bind.allUnit < 0 && bind.colorUnit < 0) return;
     GLint current = bind.current;
+    auto restoreUnit = [&](int unit, GLint previous) {
+        if (unit < 0) return;
+        if (current != unit) {
+            real.ActiveTexture(GL_TEXTURE0 + unit);
+            current = unit;
+        }
+        real.BindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
+    };
+    restoreUnit(bind.colorUnit, bind.prevColor);
+    restoreUnit(bind.allUnit, bind.prevAll);
+    restoreUnit(bind.shadowUnit, bind.prevShadow);
     for (int k = kKinds - 1; k >= 0; --k) {
         if (bind.unit[k] < 0) continue;
         if (current != bind.unit[k]) {
@@ -556,6 +685,295 @@ void unbindBuffers(const Bind& bind) {
     if (current != bind.prevActive) real.ActiveTexture(GL_TEXTURE0 + bind.prevActive);
 }
 
+
+// Deletes the shadow maps so ensureShadow() can recreate them at another resolution.
+void releaseShadow(State& st) {
+    Shadow& sh = st.sh;
+    for (int i = 0; i < 2; ++i) {
+        if (sh.fbo[i]) real.DeleteFramebuffers(1, &sh.fbo[i]);
+        if (sh.tex[i]) real.DeleteTextures(1, &sh.tex[i]);
+        if (sh.allFbo[i]) real.DeleteFramebuffers(1, &sh.allFbo[i]);
+        if (sh.allTex[i]) real.DeleteTextures(1, &sh.allTex[i]);
+        if (sh.colorTex[i]) real.DeleteTextures(1, &sh.colorTex[i]);
+    }
+    const unsigned frame = sh.sizeFrame;
+    const int wantedSize = sh.wantedSize;
+    const GLenum wantedFormat = sh.wantedFormat;
+    sh = Shadow{};
+    sh.sizeFrame = frame;
+    sh.wantedSize = wantedSize;
+    sh.wantedFormat = wantedFormat;
+}
+
+// Resolution and depth format requested by the material (ShadowRes.x / .y), read at most once per frame.
+void wantedShadowRes(GLuint program, const Units* units, int& size, GLenum& format) {
+    float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // x = size, y = depth bits
+    if (units->shadowResLoc >= 0 && real.GetUniformfv) real.GetUniformfv(program, units->shadowResLoc, v);
+    size = kShadowSize;   // unset / zero: default
+    if (v[0] >= 1.0f) size = std::clamp(static_cast<int>(v[0] + 0.5f), kShadowSizeMin, kShadowSizeMax);
+    // 16 bit (default) halves the memory and bandwidth (good on tile based GPUs); 24 bit for more precision, 32 bit float for very long shadow ranges
+    format = v[1] > 28.0f ? GL_DEPTH_COMPONENT32F : (v[1] >= 20.0f ? GL_DEPTH_COMPONENT24 : kShadowFormat);
+}
+
+// Creates the two depth textures + framebuffers once per context (and again when the resolution changes).
+bool ensureShadow(State& st, int size) {
+    Shadow& sh = st.sh;
+    if (sh.created) return true;
+    if (sh.failed) return false;
+    sh.size = size;
+    sh.format = sh.wantedFormat;
+    Saved saved{};
+    save(saved);
+    while (real.GetError() != 0) {}
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) {
+        real.GenTextures(1, &sh.tex[i]);
+        real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
+        real.BindTexture(GL_TEXTURE_2D, sh.tex[i]);
+        real.TexStorage2D(GL_TEXTURE_2D, 1, sh.format, size, size);
+        real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+        real.GenFramebuffers(1, &sh.fbo[i]);
+        real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.fbo[i]);
+        real.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, sh.tex[i], 0);
+        const GLenum none = GL_NONE;   // depth-only: no colour output
+        real.DrawBuffers(1, &none);
+        ok = real.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    }
+    restore(saved);
+    if (real.GetError() != 0) ok = false;
+    while (real.GetError() != 0) {}
+    if (!ok) {
+        sh.failed = true;
+        return false;
+    }
+    sh.created = true;
+    return true;
+}
+
+// Creates the all-casters map (depth + colour, twice) the first time a transparent caster is drawn.
+// On failure only the coloured shadows are lost, the opaque map keeps working.
+bool ensureAllCasters(State& st) {
+    Shadow& sh = st.sh;
+    if (sh.allCreated) return true;
+    if (sh.allFailed) return false;
+    Saved saved{};
+    save(saved);
+    while (real.GetError() != 0) {}
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) {
+        auto makeTexture = [&](GLuint& tex, GLenum format) {
+            real.GenTextures(1, &tex);
+            real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
+            real.BindTexture(GL_TEXTURE_2D, tex);
+            real.TexStorage2D(GL_TEXTURE_2D, 1, format, sh.size, sh.size);
+            real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+        };
+        makeTexture(sh.allTex[i], sh.format);
+        makeTexture(sh.colorTex[i], GL_RGBA8);
+        real.GenFramebuffers(1, &sh.allFbo[i]);
+        real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[i]);
+        real.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, sh.allTex[i], 0);
+        real.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sh.colorTex[i], 0);
+        const GLenum buffer = GL_COLOR_ATTACHMENT0;
+        real.DrawBuffers(1, &buffer);
+        ok = real.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    }
+    restore(saved);
+    if (real.GetError() != 0) ok = false;
+    while (real.GetError() != 0) {}
+    if (!ok) {
+        for (int i = 0; i < 2; ++i) {
+            if (sh.allFbo[i]) real.DeleteFramebuffers(1, &sh.allFbo[i]);
+            if (sh.allTex[i]) real.DeleteTextures(1, &sh.allTex[i]);
+            if (sh.colorTex[i]) real.DeleteTextures(1, &sh.colorTex[i]);
+            sh.allFbo[i] = sh.allTex[i] = sh.colorTex[i] = 0;
+        }
+        sh.allFailed = true;
+        return false;
+    }
+    sh.allCreated = true;
+    return true;
+}
+
+// Shadow-pass culling (the same idea as OptiFine's ShadowFrustum / applyFrustumShadow): a chunk draw whose box lies
+// completely outside the shadow map cannot put a single pixel into it, so the second draw is skipped. The hardware
+// would clip all of its triangles anyway, but only after the vertex shader ran for every vertex of the chunk.
+// Opt-in per material through the uniform ShadowCull (vec4): x = map radius in blocks (also used by the shader),
+// y = depth range, z = 1 to enable culling for this program (terrain only, entities have no known bounds).
+// The chunk position comes from the u_model translation, which is relative to the camera like the caster maths.
+// Anything unexpected (no uniform, instanced draw, matrix that is not a plain translation) -> not culled.
+bool cullsOutsideMap(State& st, GLuint program, const Units* units, bool instanced) {
+    if (instanced || units->modelLoc < 0) return false;
+    Units::Cull& c = units->cull;
+    if (c.frame != st.frame) {
+        c.frame = st.frame;
+        float p[4] = {0.0f, 0.0f, 0.0f, 0.0f}, t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        real.GetUniformfv(program, units->cullLoc, p);
+        real.GetUniformfv(program, units->timeLoc, t);
+        c.on = p[2] > 0.5f && p[0] > 1.0f;
+        c.radius = p[0];
+        // Same circle as sunDirection() in the shader, but without its stepping: the sun is at most one step (half a degree
+        // by default, SHADOW_SUN_STEP) away from this, and the margin below covers up to about 5 degrees.
+        const float turns = t[0] - std::floor(t[0]);
+        const float a = 6.28318530718f * turns;
+        c.lx = -std::sin(a);
+        c.ly = std::cos(a);
+        if (!(c.ly > 0.0f)) { c.lx = -c.lx; c.ly = -c.ly; }
+        c.limit = p[0] + 16.0f + 0.1f * p[0];   // radius + texel snap + sun angle error + slack
+    }
+    if (!c.on) return false;
+    float m[16];
+    real.GetUniformfv(program, units->modelLoc, m);
+    // chunk draws use a plain translation (unit scale, no rotation); the translation is either in elements 12-14 or 3,7,11
+    // depending on the matrix layout, the other three are zero
+    const float eps = 0.01f;
+    if (std::fabs(m[0] - 1.0f) > eps || std::fabs(m[5] - 1.0f) > eps || std::fabs(m[10] - 1.0f) > eps) return false;
+    const bool zeroA = std::fabs(m[3]) < eps && std::fabs(m[7]) < eps && std::fabs(m[11]) < eps;
+    const bool zeroB = std::fabs(m[12]) < eps && std::fabs(m[13]) < eps && std::fabs(m[14]) < eps;
+    float x, y, z;
+    if (zeroA) { x = m[12]; y = m[13]; z = m[14]; }
+    else if (zeroB) { x = m[3]; y = m[7]; z = m[11]; }
+    else return false;
+    constexpr float kHalf = 16.0f;   // generous half size of a chunk box around origin + 8 (a 16 block chunk)
+    const float cx = z + 8.0f;                              // light space "right" = (0, 0, 1)
+    const float cy = (x + 8.0f) * c.ly - (y + 8.0f) * c.lx; // light space "up" = (ly, -lx, 0)
+    const float ey = kHalf * (std::fabs(c.lx) + std::fabs(c.ly));
+    return std::fabs(cx) > c.limit + kHalf || std::fabs(cy) > c.limit + ey;
+}
+
+// Called right after a real draw: if the current program is a shadow caster, repeat the exact same draw
+// into the shadow maps with the caster's pass uniform = 1. All other GL state (VAO, buffers, textures, uniforms) is the
+// one the game just used, so nothing has to be recorded. Everything we touch is restored afterwards.
+//   opaque caster      ("ShadowPass")            -> opaque depth map; also the all-casters map if that one is already running this frame
+//   transparent caster ("ShadowTransparentPass") -> all-casters map only (depth test against the opaque depth copied into it)
+template <class Redraw>
+void castShadow(const Bind& bind, bool instanced, Redraw&& redraw) {
+    if (bind.program <= 0) return;
+    State& st = state();
+    const Units* units = unitsFor(st, static_cast<GLuint>(bind.program));
+    const bool opaque = units->shadowPassLoc >= 0;
+    const bool transparent = !opaque && units->transPassLoc >= 0;
+    if (!opaque && !transparent) return;
+    if (cullsOutsideMap(st, static_cast<GLuint>(bind.program), units, instanced)) return;   // nothing of it can land in the map
+    if (st.sh.sizeFrame != st.frame) {
+        st.sh.sizeFrame = st.frame;
+        int wanted = 0;
+        GLenum wantedFormat = kShadowFormat;
+        wantedShadowRes(static_cast<GLuint>(bind.program), units, wanted, wantedFormat);
+        st.sh.wantedSize = wanted;
+        st.sh.wantedFormat = wantedFormat;
+        if ((st.sh.created || st.sh.failed) && (st.sh.size != wanted || st.sh.format != wantedFormat)) releaseShadow(st);
+    }
+    if (!ensureShadow(st, st.sh.wantedSize ? st.sh.wantedSize : kShadowSize)) return;
+    if (transparent && !ensureAllCasters(st)) return;
+    Shadow& sh = st.sh;
+
+    GLint drawFbo = 0, depthFunc = 0, depthMask = 0, viewport[4] = {0, 0, 0, 0};
+    float clearDepth = 1.0f;
+    real.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+    for (int i = 0; i < 2; ++i) {
+        if (drawFbo == static_cast<GLint>(sh.fbo[i]) || (sh.allFbo[i] && drawFbo == static_cast<GLint>(sh.allFbo[i]))) return;
+    }
+    real.GetIntegerv(GL_VIEWPORT, viewport);
+    real.GetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+    real.GetIntegerv(GL_DEPTH_WRITEMASK, &depthMask);
+    const GLboolean scissor = real.IsEnabled(GL_SCISSOR_TEST), discard = real.IsEnabled(GL_RASTERIZER_DISCARD);
+    const GLboolean depthTest = real.IsEnabled(GL_DEPTH_TEST), polyOffset = real.IsEnabled(GL_POLYGON_OFFSET_FILL);
+    // colour state is only touched while drawing into the all-casters map
+    const bool colour = transparent || (opaque && sh.allCreated && sh.allFrame == st.frame);
+    GLboolean blend = 0, colorMask[4] = {1, 1, 1, 1};
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (colour) {
+        blend = real.IsEnabled(GL_BLEND);
+        real.GetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+        real.GetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+    }
+
+    // Only change what differs from the game's state (during chunk draws that is usually just the viewport,
+    // the depth function and polygon offset); the same checks are used to restore it afterwards.
+    const bool sameViewport = viewport[0] == 0 && viewport[1] == 0 && viewport[2] == sh.size && viewport[3] == sh.size;
+    if (!sameViewport) real.Viewport(0, 0, sh.size, sh.size);
+    if (scissor) real.Disable(GL_SCISSOR_TEST);
+    if (discard) real.Disable(GL_RASTERIZER_DISCARD);
+    if (!depthTest) real.Enable(GL_DEPTH_TEST);
+    if (static_cast<GLenum>(depthFunc) != GL_LESS) real.DepthFunc(GL_LESS);
+    if (!depthMask) real.DepthMask(1);
+    if (!polyOffset) real.Enable(GL_POLYGON_OFFSET_FILL);
+    real.PolygonOffset(kShadowPolySlope, kShadowPolyUnits);
+
+    // the opaque depth map is cleared once per frame, whichever kind of caster comes first
+    if (sh.clearedFrame != st.frame) {
+        sh.clearedFrame = st.frame;
+        real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.fbo[sh.write]);
+        real.GetFloatv(GL_DEPTH_CLEAR_VALUE, &clearDepth);
+        real.ClearDepthf(1.0f);
+        real.Clear(GL_DEPTH_BUFFER_BIT);
+        real.ClearDepthf(clearDepth);
+    }
+
+    // draws into the all-casters map: opaque colour output must not be blended, masked or alpha-tested away
+    auto drawAll = [&](GLint passLoc) {
+        real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
+        real.Disable(GL_BLEND);
+        real.ColorMask(1, 1, 1, 1);
+        real.Uniform4f(passLoc, 1.0f, 0.0f, 0.0f, 0.0f);
+        redraw();
+        real.Uniform4f(passLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+    };
+
+    if (opaque) {
+        real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.fbo[sh.write]);
+        real.Uniform4f(units->shadowPassLoc, 1.0f, 0.0f, 0.0f, 0.0f);
+        redraw();
+        real.Uniform4f(units->shadowPassLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+        // opaque caster that comes after the first transparent one: keep the all-casters depth complete
+        if (colour) drawAll(units->shadowPassLoc);
+    } else {
+        if (sh.allFrame != st.frame) {
+            sh.allFrame = st.frame;
+            // start of the all-casters map: depth = every opaque caster drawn so far, colour = "nothing" (white, alpha 0)
+            GLint readFbo = 0;   // only this once-per-frame copy touches the read binding
+            real.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+            real.BindFramebuffer(GL_READ_FRAMEBUFFER, sh.fbo[sh.write]);
+            real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
+            real.BlitFramebuffer(0, 0, sh.size, sh.size, 0, 0, sh.size, sh.size, GL_DEPTH_BUFFER_BIT, static_cast<GLenum>(GL_NEAREST));
+            real.BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFbo));
+            real.ColorMask(1, 1, 1, 1);
+            real.ClearColor(1.0f, 1.0f, 1.0f, 0.0f);
+            real.Clear(GL_COLOR_BUFFER_BIT);
+        }
+        drawAll(units->transPassLoc);
+    }
+
+    if (colour) {
+        real.ColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+        real.ClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+        setEnabled(GL_BLEND, blend);
+    }
+    if (!polyOffset) real.Disable(GL_POLYGON_OFFSET_FILL);
+    if (!depthMask) real.DepthMask(0);
+    if (static_cast<GLenum>(depthFunc) != GL_LESS) real.DepthFunc(static_cast<GLenum>(depthFunc));
+    if (!depthTest) real.Disable(GL_DEPTH_TEST);
+    if (discard) real.Enable(GL_RASTERIZER_DISCARD);
+    if (scissor) real.Enable(GL_SCISSOR_TEST);
+    if (!sameViewport) real.Viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFbo));
+    // Our calls were validated when the maps were created; draining the error queue after every single draw is a
+    // driver round trip, so only do it for the first draws (keeps a one-off error from reaching the game's own checks).
+    if (sh.castsSinceCreate < 240) {
+        ++sh.castsSinceCreate;
+        while (real.GetError() != 0) {}
+    }
+}
+
 void onContextChanged(State& st, void* ctx) {
     st.ctx = ctx;
     st.unitsOf.clear();
@@ -565,6 +983,7 @@ void onContextChanged(State& st, void* ctx) {
     st.tr = Track{};
     st.tr.bad = bad;
     ++st.epoch;
+    st.sh = Shadow{};
     for (int k = 0; k < kKinds; ++k) {
         st.own[k] = Own{};
         st.fallback[k] = 0;
@@ -609,27 +1028,33 @@ Bind onDraw() {
         real.GetIntegerv(GL_CURRENT_PROGRAM, &program);
         if (!st.tr.bad) st.tr.program = program;
     }
-    return bindBuffers(st, program);
+    Bind bind = bindBuffers(st, program);
+    bind.program = program;
+    return bind;
 }
 
 void drawElementsDetour(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     const Bind bind = onDraw();
     resolve(kDrawElements, real.DrawElements)(mode, count, type, indices);
+    if (count > 0) castShadow(bind, false, [&] { resolve(kDrawElements, real.DrawElements)(mode, count, type, indices); });
     unbindBuffers(bind);
 }
 void drawArraysDetour(GLenum mode, GLint first, GLsizei count) {
     const Bind bind = onDraw();
     resolve(kDrawArrays, real.DrawArrays)(mode, first, count);
+    if (count > 0) castShadow(bind, false, [&] { resolve(kDrawArrays, real.DrawArrays)(mode, first, count); });
     unbindBuffers(bind);
 }
 void drawElementsInstancedDetour(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instances) {
     const Bind bind = onDraw();
     resolve(kDrawElementsInstanced, real.DrawElementsInstanced)(mode, count, type, indices, instances);
+    if (count > 0 && instances > 0) castShadow(bind, true, [&] { resolve(kDrawElementsInstanced, real.DrawElementsInstanced)(mode, count, type, indices, instances); });
     unbindBuffers(bind);
 }
 void drawArraysInstancedDetour(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
     const Bind bind = onDraw();
     resolve(kDrawArraysInstanced, real.DrawArraysInstanced)(mode, first, count, instances);
+    if (count > 0 && instances > 0) castShadow(bind, true, [&] { resolve(kDrawArraysInstanced, real.DrawArraysInstanced)(mode, first, count, instances); });
     unbindBuffers(bind);
 }
 
@@ -726,6 +1151,12 @@ void endFrame(State& st) {
         } else {
             st.failedFrames[k] = 0;
         }
+    }
+    // finished shadow map becomes the one receivers read next frame
+    if (st.sh.created && st.sh.clearedFrame == st.frame) {
+        st.sh.allReadValid = st.sh.allCreated && st.sh.allFrame == st.frame;   // no transparent casters this frame: receivers get the white fallback
+        st.sh.write ^= 1;
+        st.sh.readValid = true;
     }
     ++st.frame;
 }
@@ -934,11 +1365,12 @@ bool installGlHooks() {
 #define LOAD(n) load(real.n, "gl" #n)
     LOAD(BindFramebuffer); LOAD(FramebufferTexture2D); LOAD(DrawElements); LOAD(DrawArrays); LOAD(DrawElementsInstanced); LOAD(DrawArraysInstanced);
     LOAD(GenTextures); LOAD(DeleteTextures); LOAD(BindTexture); LOAD(TexParameteri); LOAD(TexStorage2D); LOAD(ActiveTexture);
-    LOAD(GenFramebuffers); LOAD(BlitFramebuffer); LOAD(CheckFramebufferStatus); LOAD(GetUniformLocation); LOAD(GetUniformiv);
+    LOAD(GenFramebuffers); LOAD(BlitFramebuffer); LOAD(CheckFramebufferStatus); LOAD(GetUniformLocation); LOAD(GetUniformiv); LOAD(GetUniformfv);
     LOAD(GetIntegerv); LOAD(IsEnabled); LOAD(Enable); LOAD(Disable); LOAD(GetError);
     LOAD(GetTexLevelParameteriv); LOAD(GetRenderbufferParameteriv); LOAD(BindRenderbuffer); LOAD(GetFramebufferAttachmentParameteriv);
     LOAD(UseProgram); LOAD(LinkProgram); LOAD(DeleteProgram); LOAD(DeleteFramebuffers); LOAD(DeleteRenderbuffers);
     LOAD(FramebufferTextureLayer); LOAD(FramebufferRenderbuffer); LOAD(TexImage2D); LOAD(RenderbufferStorage); LOAD(RenderbufferStorageMultisample); LOAD(ReadBuffer);
+    LOAD(Uniform4f); LOAD(Viewport); LOAD(Clear); LOAD(ClearDepthf); LOAD(DepthMask); LOAD(DepthFunc); LOAD(DrawBuffers); LOAD(PolygonOffset); LOAD(GetFloatv); LOAD(ClearColor); LOAD(ColorMask); LOAD(GetBooleanv);
 #undef LOAD
     real.ProgramBinary = reinterpret_cast<decltype(real.ProgramBinary)>(::dlsym(gles, "glProgramBinary"));
     if (!complete) return false;

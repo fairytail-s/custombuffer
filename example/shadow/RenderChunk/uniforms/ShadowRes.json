@@ -1,0 +1,11 @@
+{
+  "name": "ShadowRes",
+  "type": "vec4",
+  "count": 1,
+  "default": [
+    512.0,
+    16.0,
+    0.0,
+    0.0
+  ]
+}

@@ -1,30 +1,29 @@
 # Custom Buffers
 
-Custom Buffers is an open-source native mod for Minecraft Bedrock on Android, made for [LeviLauncher](https://github.com/LiteLDev/LeviLaunchroid).
-
-It gives materials extra textures of the frame being drawn.
+An open-source native mod for Minecraft Bedrock on Android, made for [LeviLauncher](https://github.com/LiteLDev/LeviLaunchroid). It gives materials extra textures of the frame being drawn, and can render shadow maps.
 
 ## Features
 
-- `s_ScreenBuffer`: a copy of the colour buffer drawn so far (half resolution when the game is not multisampled)
-- `s_SceneDepthBuffer`: a copy of the depth buffer drawn so far (raw depth in `.r`, 0 to 1)
-- Each buffer is only copied when a shader actually uses it
+- `s_ScreenBuffer`: copy of the colour buffer drawn so far (half resolution when the game is not multisampled)
+- `s_SceneDepthBuffer`: copy of the depth buffer drawn so far (raw depth in `.r`, 0 to 1)
+- `s_ShadowMap`, `s_ShadowAll`, `s_ShadowColor`: shadow maps, including coloured shadows from glass and water
+- Every buffer is only copied or drawn when a shader actually uses it
 
 ## Requirements
 
-- Android 9 or newer and a 64-bit ARM device (`arm64-v8a`)
-- [LeviLauncher](https://github.com/LiteLDev/LeviLaunchroid) to load the mod
+- Android 9 or newer, 64-bit ARM (`arm64-v8a`)
+- [LeviLauncher](https://github.com/LiteLDev/LeviLaunchroid)
 - Minecraft Bedrock **26.52**
 
 ## Installation
 
 1. Install LeviLauncher.
-2. Import `CustomBuffers.levipack` through the launcher's mod manager and enable it.
+2. Import `CustomBuffers.levipack` in the launcher's mod manager and enable it.
 3. Launch Minecraft through LeviLauncher.
 
-## Use in a material
+## Screen and depth buffers
 
-Add the buffers you need as `texture2D` (see `example/RenderChunk/buffers`: `ScreenBuffer` is slot 3), then declare the samplers in the pass that needs them:
+Declare the samplers in the pass that needs them. The copy holds everything drawn before that pass.
 
 ```glsl
 SAMPLER2D_AUTOREG(s_ScreenBuffer);
@@ -36,24 +35,41 @@ vec3 screen = texture2D(s_ScreenBuffer, uv).rgb;
 float depth = texture2D(s_SceneDepthBuffer, duv).r;
 ```
 
-The copy holds everything drawn before the pass that declares the sampler. Keep the depth buffer's sampler filter on **Point**. Without the mod the colour sampler is white and the depth sampler reads 1.0. When the mod has no copy for a draw (for example while a world is closing or its thumbnail is rendered), it binds a 1x1 white texture instead, so `textureSize(s_ScreenBuffer, 0).x < 8` tells a material to skip its effect rather than sample whatever the game left on that unit.
+- Keep the depth sampler on **Point** filtering.
+- Without the mod, the colour sampler is white and the depth sampler reads 1.0.
+- When there is no copy for a draw (a world closing, a thumbnail render), the mod binds a 1x1 white texture. `textureSize(s_ScreenBuffer, 0).x < 8` tells a material to skip its effect.
+
+## Shadows
+
+The mod redraws the world from the sun into a depth map and gives it back to materials. The material decides what casts and what receives. A complete working pack is in [`example/shadow/`](example/shadow/), and [docs/shadows.md](docs/shadows.md) explains it step by step.
+
+| Uniform / sampler | Declared by | Meaning |
+| --- | --- | --- |
+| `ShadowPass` (`vec4`) | opaque casters | `x = 1` while the mod redraws that program into the map |
+| `ShadowTransparentPass` (`vec4`) | transparent casters (glass, water) | same, into the coloured all-casters map |
+| `s_ShadowMap`, `s_ShadowAll`, `s_ShadowColor` | receivers | opaque depth, all-casters depth, colour of the nearest caster |
+| `ShadowRes` (`vec4`) | casters | `x` = texels per side (256-4096, default 2048 if unset), `y` = depth bits (16 default, 24, 32 = float) |
+| `ShadowCull` (`vec4`) | terrain casters | `x` = map radius in blocks, `y` = depth range, `z = 1` skips chunk draws outside the map |
+
+- Every caster draw is issued twice; the second one is depth-only. Only chunks the game already draws this frame cast.
+- Receivers read the map finished in the **previous** frame, so use `LastCameraPosition` to line up with it.
+- Distortion and sun direction are done in the material, not the mod.
+- The depth format fallback and polygon-offset bias are constants at the top of `src/GlHooks.cpp`.
+
+> **Known issue** The sun direction and the shadow movement while the sun is moving are still a bit buggy: shadows can flicker, jump or shift slightly as the time of day changes. Hard sun steps (`SHADOW_SUN_STEP`, `SHADOW_SUN_GLIDE = 0`) reduce it but do not remove it.
 
 ## Build
 
-Requires Android NDK r28c, Python 3, and either xmake or CMake 3.22 or newer.
-
-### xmake
+Requires Android NDK r28c, Python 3, and xmake or CMake 3.22+.
 
 ```sh
+# xmake
 xmake f -y -p android -a arm64-v8a -m release --ndk=/path/to/android-ndk-r28c --ndk_sdkver=28
 xmake -y
-```
 
-### CMake
-
-```sh
+# CMake
 cmake -S . -B build-cmake -DCMAKE_TOOLCHAIN_FILE=/path/to/android-ndk-r28c/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cmake --parallel
 ```
 
-Both builds produce `CustomBuffers.so` and `CustomBuffers.levipack`.
+Both produce `CustomBuffers.so` and `CustomBuffers.levipack`.

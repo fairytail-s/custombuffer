@@ -1,0 +1,82 @@
+$input v_color0, v_fog, v_light, v_texcoord0, v_shadow, v_sun, v_normal
+
+#include <bgfx_shader.sh>
+#include <MinecraftRenderer.Materials/ActorUtil.dragonh>
+#define SHADOW_RECEIVER 1
+#include <utils/shadow.h>
+
+uniform vec4 ColorBased;
+uniform vec4 ChangeColor;
+uniform vec4 UseAlphaRewrite;
+uniform vec4 TintedAlphaTestEnabled;
+uniform vec4 MatColor;
+uniform vec4 OverlayColor;
+uniform vec4 MultiplicativeTintColor;
+uniform vec4 ActorFPEpsilon;
+uniform vec4 HudOpacity;
+
+SAMPLER2D_AUTOREG(s_MatTexture);
+SAMPLER2D_AUTOREG(s_MatTexture1);
+
+void main() {
+  #if defined(DEPTH_ONLY) || defined(INSTANCING)
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  #elif defined(DEPTH_ONLY_OPAQUE)
+    gl_FragColor = vec4(mix(vec3_splat(1.0), v_fog.rgb, v_fog.a), 1.0);
+    return;
+  #endif
+
+  #ifdef SHADOW
+    if (ShadowPass.x > 0.5) {
+      #ifdef ALPHA_TEST
+        vec4 casterAlbedo = getActorAlbedoNoColorChange(v_texcoord0, s_MatTexture, s_MatTexture1, MatColor);
+        float casterAlpha = mix(casterAlbedo.a, (casterAlbedo.a * OverlayColor.a), TintedAlphaTestEnabled.x);
+        if (shouldDiscard(casterAlbedo.rgb, casterAlpha, ActorFPEpsilon.x)) {
+          discard;
+        }
+      #endif
+      gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);   // shadow map colour = "nothing" (only depth matters for opaque casters)
+      return;
+    }
+  #endif
+
+  vec4 albedo = getActorAlbedoNoColorChange(v_texcoord0, s_MatTexture, s_MatTexture1, MatColor);
+
+  #ifdef ALPHA_TEST
+    float alpha = mix(albedo.a, (albedo.a * OverlayColor.a), TintedAlphaTestEnabled.x);
+    if (shouldDiscard(albedo.rgb, alpha, ActorFPEpsilon.x)) {
+      discard;
+    }
+  #endif
+
+  #ifdef CHANGE_COLOR_MULTI
+    albedo = applyMultiColorChange(albedo, ChangeColor.rgb, MultiplicativeTintColor.rgb);
+  #elif defined(CHANGE_COLOR)
+    albedo = applyColorChange(albedo, ChangeColor, albedo.a);
+    albedo.a *= ChangeColor.a;
+  #endif
+
+  #ifdef ALPHA_TEST
+    albedo.a = max(UseAlphaRewrite.r, albedo.a);
+  #endif
+
+  albedo.rgb *= mix(vec3(1.0, 1.0, 1.0), v_color0.rgb, ColorBased.x);
+
+  albedo = applyOverlayColor(albedo, OverlayColor);
+
+  albedo = applyEmissiveLighting(albedo, v_light);
+
+  #ifdef SHADOW
+    // sunlight per colour channel: tinted when it passed through glass or water
+    albedo.rgb *= mix(vec3_splat(SHADOW_BRIGHTNESS), vec3_splat(1.0), shadowLit(v_shadow, dot(normalize(v_normal), v_sun)));
+  #endif
+
+  #ifdef TRANSPARENT
+    albedo = applyHudOpacity(albedo, HudOpacity.x);
+  #endif
+
+  albedo.rgb = mix(albedo.rgb, v_fog.rgb, v_fog.a);
+
+  gl_FragColor = albedo;
+}

@@ -2,7 +2,7 @@
   "type": "preload-native",
   "name": "CustomBuffers",
   "author": "chromehaert",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "entry": "CustomBuffers.so",
   "minecraft_versions": [
     "1.26.*",

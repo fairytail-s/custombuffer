@@ -1,0 +1,19 @@
+{
+  "name": "ShadowMap",
+  "register_slot": 5,
+  "binding_slot": 5,
+  "type": "texture2D",
+  "precision": "highp",
+  "access": "undefined",
+  "texture_format": "",
+  "default_texture": "white",
+  "unordered_access": false,
+  "slot_count": 1,
+  "texture_path": "",
+  "unknown": 0,
+  "sampler_state": {
+    "filter": "Point",
+    "wrapping": "Clamp"
+  },
+  "custom_type_info": {}
+}

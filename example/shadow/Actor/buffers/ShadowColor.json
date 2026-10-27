@@ -1,7 +1,7 @@
 {
-  "name": "SceneDepthBuffer",
-  "register_slot": 4,
-  "binding_slot": 4,
+  "name": "ShadowColor",
+  "register_slot": 7,
+  "binding_slot": 7,
   "type": "texture2D",
   "precision": "highp",
   "access": "undefined",

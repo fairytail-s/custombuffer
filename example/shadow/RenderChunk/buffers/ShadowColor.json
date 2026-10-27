@@ -1,9 +1,9 @@
 {
-  "name": "ScreenBuffer",
-  "register_slot": 3,
-  "binding_slot": 3,
+  "name": "ShadowColor",
+  "register_slot": 7,
+  "binding_slot": 7,
   "type": "texture2D",
-  "precision": "lowp",
+  "precision": "highp",
   "access": "undefined",
   "texture_format": "",
   "default_texture": "white",
@@ -12,7 +12,7 @@
   "texture_path": "",
   "unknown": 0,
   "sampler_state": {
-    "filter": "Bilinear",
+    "filter": "Point",
     "wrapping": "Clamp"
   },
   "custom_type_info": {}
