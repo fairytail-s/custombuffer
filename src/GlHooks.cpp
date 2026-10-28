@@ -73,7 +73,7 @@ constexpr int kEglDraw = 0x3059;
 // of the PREVIOUS frame (double buffered), so receivers never read a half-built map.
 // Resolution comes from the material: the uniform "ShadowRes" (vec4: x = texels per side, y = depth bits, z/w unused) of the caster
 // program, read once per frame. The map is recreated whenever it changes. Without that uniform: the default.
-constexpr int kShadowSize = 2048;                 // default texels per side
+constexpr int kShadowSize = 1024;                 // default texels per side
 constexpr int kShadowSizeMin = 256, kShadowSizeMax = 4096;
 constexpr GLenum kShadowFormat = GL_DEPTH_COMPONENT16;   // default (ShadowRes.y unset / 0); ShadowRes.y = 24 or 32 picks DEPTH_COMPONENT24 / 32F
 constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 4.0f;  // slope-scaled depth bias while casting
@@ -730,7 +730,7 @@ bool ensureShadow(State& st, int size) {
         real.GenTextures(1, &sh.tex[i]);
         real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
         real.BindTexture(GL_TEXTURE_2D, sh.tex[i]);
-        real.TexStorage2D(GL_TEXTURE_2D, 1, sh.format, size, size);
+        real.TexStorage2D(GL_TEXTURE_2D, 1, sh.format, size * 2, size);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -769,7 +769,7 @@ bool ensureAllCasters(State& st) {
             real.GenTextures(1, &tex);
             real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
             real.BindTexture(GL_TEXTURE_2D, tex);
-            real.TexStorage2D(GL_TEXTURE_2D, 1, format, sh.size, sh.size);
+            real.TexStorage2D(GL_TEXTURE_2D, 1, format, sh.size * 2, sh.size);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -919,32 +919,35 @@ void castShadow(const Bind& bind, bool instanced, Redraw&& redraw) {
         real.ClearDepthf(clearDepth);
     }
 
-    // draws into the all-casters map: opaque colour output must not be blended, masked or alpha-tested away
+    auto drawCascade = [&](int cascade, GLint passLoc) {
+        real.Viewport(cascade * sh.size, 0, sh.size, sh.size);
+        real.Uniform4f(passLoc, 1.0f, static_cast<float>(cascade), 0.0f, 0.0f);
+        redraw();
+    };
+
     auto drawAll = [&](GLint passLoc) {
         real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
         real.Disable(GL_BLEND);
         real.ColorMask(1, 1, 1, 1);
-        real.Uniform4f(passLoc, 1.0f, 0.0f, 0.0f, 0.0f);
-        redraw();
+        drawCascade(0, passLoc);
+        drawCascade(1, passLoc);
         real.Uniform4f(passLoc, 0.0f, 0.0f, 0.0f, 0.0f);
     };
 
     if (opaque) {
         real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.fbo[sh.write]);
-        real.Uniform4f(units->shadowPassLoc, 1.0f, 0.0f, 0.0f, 0.0f);
-        redraw();
+        drawCascade(0, units->shadowPassLoc);
+        drawCascade(1, units->shadowPassLoc);
         real.Uniform4f(units->shadowPassLoc, 0.0f, 0.0f, 0.0f, 0.0f);
-        // opaque caster that comes after the first transparent one: keep the all-casters depth complete
         if (colour) drawAll(units->shadowPassLoc);
     } else {
         if (sh.allFrame != st.frame) {
             sh.allFrame = st.frame;
-            // start of the all-casters map: depth = every opaque caster drawn so far, colour = "nothing" (white, alpha 0)
-            GLint readFbo = 0;   // only this once-per-frame copy touches the read binding
+            GLint readFbo = 0;
             real.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
             real.BindFramebuffer(GL_READ_FRAMEBUFFER, sh.fbo[sh.write]);
             real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
-            real.BlitFramebuffer(0, 0, sh.size, sh.size, 0, 0, sh.size, sh.size, GL_DEPTH_BUFFER_BIT, static_cast<GLenum>(GL_NEAREST));
+            real.BlitFramebuffer(0, 0, sh.size * 2, sh.size, 0, 0, sh.size * 2, sh.size, GL_DEPTH_BUFFER_BIT, static_cast<GLenum>(GL_NEAREST));
             real.BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFbo));
             real.ColorMask(1, 1, 1, 1);
             real.ClearColor(1.0f, 1.0f, 1.0f, 0.0f);

@@ -13,7 +13,7 @@ tutorial: render the world from the sun, read that picture back, compare depths,
 3. [The caster pass](#the-caster-pass)
 4. [The sun direction](#the-sun-direction)
 5. [Shadow space](#shadow-space)
-6. [Shadow distortion](#shadow-distortion)
+6. [Cascaded shadow mapping](#cascaded-shadow-mapping)
 7. [Reading the shadow map](#reading-the-shadow-map)
 8. [Shadow bias](#shadow-bias)
 9. [Faces turned away from the sun](#faces-turned-away-from-the-sun)
@@ -36,16 +36,16 @@ Bedrock materials cannot create render targets or run extra passes by themselves
 
 | Part | Does what |
 | --- | --- |
-| **The mod** (`src/GlHooks.cpp`) | Owns two depth textures (16 bit by default). After every real draw of a *caster* it draws the same geometry again into the shadow texture. It hands the finished map back to materials as `s_ShadowMap`. |
+| **The mod** (`src/GlHooks.cpp`) | Owns two depth textures (16 bit by default). After every real draw of a *caster* it draws the same geometry again into the shadow texture atlas. It hands the finished map back to materials as `s_ShadowMap`. |
 | **The material** (`vertex.sc`, `fragment.sc`, `utils/shadow.h`) | Decides *what* casts, and *where* the sun is. In the caster draw it outputs vertices in the sun's view; in a normal draw it reads the map. |
 
-The mod never looks at your shader maths. The contract between them is a handful of names (the first three below are the basics; the rest are optional extras covered later):
+The mod never looks at your shader maths. The contract between them is a handful of names:
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `ShadowPass` | `vec4` uniform | Declared by every program that should cast. The mod sets `x = 1` while it redraws that program into the shadow map and `0` otherwise. |
-| `s_ShadowMap` | sampler | Declared by every program that should receive. The mod binds the finished map to it. |
-| `ShadowRes` | `vec4` uniform | `x` = map resolution (the mod reads it and resizes the map), `y` = depth bits of the maps: `0` (default) or 16 = 16 bit, 24 = 24 bit, 32 = 32 bit float. Distortion is a constant in the shaders (`SHADOW_DISTORT`). |
+| `ShadowPass` | `vec4` uniform | Declared by every program that should cast. The mod sets `x = 1` while it redraws that program into the shadow map and `0` otherwise; `y` indicates the cascade index (0 for near, 1 for far). |
+| `s_ShadowMap` | sampler | Declared by every program that should receive. The mod binds the finished map atlas to it. |
+| `ShadowRes` | `vec4` uniform | `x` = map resolution per cascade (the mod reads it and resizes the map, default 1024), `y` = depth bits: 16 (default), 24, 32 (float). |
 | `ShadowTransparentPass`, `s_ShadowAll`, `s_ShadowColor` | uniform / samplers | Optional: coloured shadows from glass and water, see [Transparent shadows](#transparent-shadows-coloured-shadows-from-glass-and-water). |
 | `ShadowCull` | `vec4` uniform | Optional: lets the mod skip terrain draws outside the map, see [Chunk culling](#chunk-culling-shadowcull). |
 
@@ -61,7 +61,7 @@ textures: it writes to one while receivers read the one finished in the **previo
 
 ```
 example/shadow/
-  utils/shadow.h              all shadow code and settings: sun, map space, distortion, bias, soft-edge lookup
+  utils/shadow.h              all shadow code and settings: sun, 2-cascade map space, bias, soft-edge lookup
   RenderChunk/                terrain: casts and receives (opaque, alpha-tested and transparent)
     config.json               from the base material
     material.json             uniform_overrides (CameraPosition, LastCameraPosition, GameTimeOfDay)
@@ -102,10 +102,9 @@ Inside `#ifdef SHADOW` the vertex shader branches on the flag:
 
 ```glsl
 if (ShadowPass.x > 0.5) {
-  // caster pass: position the vertex in the sun's view instead of the camera's
-  gl_Position = shadowCaster(worldPos, sunDirection());   // shadowClip + shadowDistort
-} else {
-  // receiver: compute where this vertex lands in the map
+  // caster pass: position the vertex in the sun's view for the active cascade
+  gl_Position = shadowCaster(worldPos, sunDirection(), ShadowPass.x > 0.5 ? ShadowPass.y : ShadowTransparentPass.y);
+  return;
 }
 ```
 
@@ -113,21 +112,20 @@ Opaque and alpha-tested geometry cast into the opaque map. Transparent geometry 
 
 What the mod does for each caster draw, in order:
 
-1. Binds the shadow framebuffer, sets the viewport to the map size, turns off scissor, enables depth test and
-   polygon offset.
-2. On the first caster draw of a frame, clears the depth to 1.0.
-3. Sets `ShadowPass.x = 1` and re-issues the same draw (same buffers, same uniforms).
-4. Sets `ShadowPass.x = 0` and restores every piece of GL state it touched.
+1. Binds the shadow framebuffer, turns off scissor, enables depth test and polygon offset.
+2. On the first caster draw of a frame, clears the depth atlas to 1.0.
+3. Sets viewport to `(0, 0, size, size)` and `ShadowPass.y = 0` to render Cascade 0 (near cascade).
+4. Sets viewport to `(size, 0, size, size)` and `ShadowPass.y = 1` to render Cascade 1 (far cascade).
+5. Restores original viewport and GL state.
 
 ### Skipping the shading work
 
-Only depth matters in the second draw, so the fragment shader leaves immediately. Alpha-tested geometry still has to
-run its cut-out test, otherwise leaves would cast solid squares:
+Only depth matters in caster draws, so the fragment shader leaves immediately:
 
 ```glsl
 #ifdef SHADOW
   if (ShadowPass.x > 0.5) {
-    gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);   // colour is ignored here
+    gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);
     return;
   }
 #endif
@@ -145,8 +143,9 @@ x-y plane (east-west arc, no north-south tilt):
 ```glsl
 vec3 sunDirection() {
   float steps = 360.0 / SHADOW_SUN_STEP;
-  float t = fract(GameTimeOfDay.x) * steps;
-  float f = floor(t + 0.001);                     // hold the sun on a step
+  float t = ((SHADOW_DEBUG_FREEZE_SUN >= 0.0) ? SHADOW_DEBUG_FREEZE_SUN : fract(GameTimeOfDay.x)) * steps;
+  float f = floor(t + 0.001);
+  if (SHADOW_SUN_GLIDE > 0.0) { f += smoothstep(1.0 - SHADOW_SUN_GLIDE, 1.0, fract(t)); }
   float a = 2.0 * pi * (f / steps);
   vec3 s = vec3(-sin(a), cos(a), 0.0);
   return (s.y > 0.0) ? s : -s;                    // moon takes over below the horizon
@@ -157,23 +156,6 @@ vec3 sunDirection() {
 comes from above and the moon casts shadows too. Everything else in this guide calls the result `L`: **the direction
 from the surface towards the light.**
 
-### Stepping the sun
-
-> **Known issue** Sun direction and shadow movement while the sun is moving are still a bit buggy: shadows can flicker, jump or shift slightly as the time of day changes.
-
-The map is re-rendered every frame. If the sun moves a tiny amount each frame, every shadow edge falls on slightly
-different texels each frame and the edges crawl. So the sun is held on a step and only jumps to the next one:
-
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `SHADOW_SUN_STEP` | 0.5 | Degrees per sun update (0.5 = one step about every 1.7 s of game time). |
-| `SHADOW_SUN_GLIDE` | 0.0 | Share of each step spent easing to the next. `0` = hard steps. Above 0 the sun moves during the glide and the edges crawl again. |
-| `SHADOW_DEBUG_FREEZE_SUN` | -1 | Diagnostic: `0..1` freezes the sun at that time of day, `-1` = off. |
-
-Because receivers read the map from the previous frame, each step is a one-frame error that grows with the step size and
-the distance from the camera. Smaller steps make a smaller pop; larger steps make it rarer. The `+ 0.001` stops float
-noise in the time uniform from toggling a step on an exact boundary.
-
 ---
 
 ## Shadow space
@@ -182,17 +164,17 @@ The shadow map is an **orthographic** picture of a square around the camera, loo
 it:
 
 - a basis: `right`, `up` and the light direction `L`
-- a radius: `SHADOW_RADIUS` blocks from the camera to the edge of the map (`ShadowCull.x`, default 64)
+- a radius: `radius` blocks from the camera to the edge of the cascade
 - a depth range: `SHADOW_DEPTH_RANGE` blocks along `L` (`ShadowCull.y`, default 400, covers ±400)
 
 ```glsl
-vec4 shadowClip(vec3 q, vec3 camAbs, vec3 L) {
+vec4 shadowClip(vec3 q, vec3 camAbs, vec3 L, float radius) {
   vec3 right = vec3(0.0, 0.0, 1.0);
   vec3 up = vec3(L.y, -L.x, 0.0);
-  float texel = 2.0 * SHADOW_RADIUS / SHADOW_RES;
+  float texel = 2.0 * radius / SHADOW_RES;
   vec2 snap = fract(vec2(dot(camAbs, right), dot(camAbs, up)) / texel) * texel;
   vec2 xy = vec2(dot(q, right), dot(q, up)) + snap;
-  return vec4(xy / SHADOW_RADIUS, -dot(q, L) / SHADOW_DEPTH_RANGE, 1.0);   // z: -1 = nearest the sun
+  return vec4(xy / radius, -dot(q, L) / SHADOW_DEPTH_RANGE, 1.0);
 }
 ```
 
@@ -201,10 +183,16 @@ vec4 shadowClip(vec3 q, vec3 camAbs, vec3 L) {
 
 ### Texel snapping
 
-If the map's centre followed the camera exactly, every shadow edge would slide across the texel grid as you walk and
-shimmer. The code instead shifts the map by `snap`, the camera's remainder within a texel, so the map's centre always
+If the map's centre followed the camera continuously, every shadow edge would slide across the texel grid as you walk and
+shimmer. The code shifts the map by `snap`, the camera's remainder within a texel, so the map's centre always
 sits on a whole texel in world space. Moving less than one texel changes nothing; crossing a texel boundary moves the
 whole map by exactly one texel.
+
+Both cascades share the outer cascade's texel snap size (`2.0 * SHADOW_RADIUS / SHADOW_RES`). Because `SHADOW_RADIUS` (64 blocks) is an exact integer multiple (4×) of `SHADOW_RADIUS_NEAR` (16 blocks), snapping to the outer grid also snaps to an exact integer multiple of Cascade 0 texels (every 4 texels), eliminating shimmer in both cascades simultaneously. Cascade 0 receiver coordinates derive directly by scaling without requiring fragment-stage camera uniforms:
+
+```glsl
+highp vec2 p0 = p1 * (SHADOW_RADIUS / SHADOW_RADIUS_NEAR);
+```
 
 ### Receivers and last frame's camera
 
@@ -212,52 +200,23 @@ A receiver reads the map from the previous frame, which was centred on the camer
 `LastCameraPosition` and shifts the position by how far the camera has moved since:
 
 ```glsl
-vec3 qL = worldPos + (CameraPosition.xyz - LastCameraPosition.xyz);
-vec4 sc = shadowClip(qL, LastCameraPosition.xyz, L);
-```
-
-The result goes through a varying as `v_shadow = vec4(sc.xyz * 0.5 + 0.5, strength)`: map `uv` in `xy`, depth in `z`, and
-a strength in `w` that fades shadows out when the sun is near the horizon (this also hides the day/night flip of `L`):
-
-```glsl
-float strength = smoothstep(SHADOW_SUN_FADE.x, SHADOW_SUN_FADE.y, L.y);   // 0.10 .. 0.35
+vec4 shadowReceiver(vec3 rel, vec3 L) {
+  vec3 q = rel + (CameraPosition.xyz - LastCameraPosition.xyz);
+  vec4 sc = shadowClip(q, LastCameraPosition.xyz, L, SHADOW_RADIUS);
+  return vec4(sc.xyz * 0.5 + 0.5, smoothstep(SHADOW_SUN_FADE.x, SHADOW_SUN_FADE.y, L.y));
+}
 ```
 
 ---
 
-## Shadow distortion
+## Cascaded shadow mapping
 
-With a plain orthographic map, a texel covers the same area everywhere: 128 blocks across 1024 texels is about 0.125
-blocks per texel, far too coarse right next to the player and wasted on the far edge. Distortion stretches the map
-around the camera so the centre gets many more texels.
+Following the industry standard used in Google Filament and MJP's Shadows sample, Custom Buffers implements a **2-Cascade Shadow Map (CSM)** with a stabilized linear orthographic atlas:
 
-```glsl
-vec2 shadowDistort(vec2 p) {
-  return p * ((1.0 + SHADOW_DISTORT) / (length(p) + SHADOW_DISTORT));
-}
-```
-
-`p` is in map coordinates (-1 to 1) and `k` is the constant `SHADOW_DISTORT`. The factor divides by the distance from the centre,
-so near the centre positions are pushed outward (more texels per block) and near the edge they barely move. The
-`(1 + k)` in the numerator keeps the map edge at exactly 1, so the whole map is used and geometry beyond the radius
-stays outside it instead of being squeezed in.
-
-| `k` | Texel size at the centre | Texel size at the edge |
-| --- | --- | --- |
-| off (`0`) | 1× | 1× |
-| 0.25 | about 0.2× | about 5× |
-| 0.10 (default) | about 0.09× | about 11× |
-| 0.05 | about 0.05× | about 21× |
-
-*(relative to an undistorted map; approximate.)*
-
-> **Warning** Distortion is applied in two places that must agree: the caster applies it to the vertex position, and the
-> receiver applies it to the `uv` it samples. The vertex shader deliberately sends the **undistorted** coordinates
-> through the varying and the fragment shader distorts them. Interpolating distorted values across a triangle would be
-> wrong, because the distortion is not linear.
-
-> **Note** Distortion bends straight lines, and a GPU draws straight triangles. On very large triangles close to the
-> centre this can leave blobs. Terrain is made of 1-block quads, so it is rarely visible.
+- **Cascade 0 (Near)**: Covers radius $R_{	ext{near}} = 16	ext{ blocks}$ ($32	ext{ m}$ diameter). At 1024 resolution, this yields **32 texels per block** ($3.1	ext{ cm/texel}$), delivering razor-sharp contact shadows for the player, mobs, and immediate terrain.
+- **Cascade 1 (Far)**: Covers radius $R_{	ext{far}} = 64	ext{ blocks}$ ($128	ext{ m}$ diameter). At 1024 resolution, this yields **8 texels per block**, providing broad shadow coverage across the full view distance.
+- **Shadow Atlas Layout**: The depth texture has dimensions $2048 	imes 1024$ (width $2 	imes S$, height $S$). Cascade 0 occupies the left tile ($X \in [0.0, 0.5]$), and Cascade 1 occupies the right tile ($X \in [0.5, 1.0]$).
+- **Seamless Blending**: As distance $d_0$ approaches the edge of Cascade 0 ($[0.80, 1.0]$ in normalized cascade space, roughly 12.8m to 16m), the receiver smoothly blends between Cascade 0 and Cascade 1 using `smoothstep(0.80, 1.0, d0)`, completely eliminating cascade boundary seams.
 
 ---
 
@@ -270,68 +229,26 @@ SAMPLER2D_AUTOREG(s_ShadowMap);
 uniform vec4 ShadowRes;
 ```
 
-and describe the texture in `buffers/ShadowMap.json` (slot 5, **point** filtering, **clamp** wrapping, default
-texture `white`). Depth is stored in the red channel as `0..1`. Until the first frame has been rendered, the mod binds
+Depth is stored in the red channel as `0..1`. Until the first frame has been rendered, the mod binds
 a white texture, which reads as depth 1.0: everything lit.
-
-### The comparison
-
-The map stores the depth of the surface nearest the sun. Our depth `z` is the same quantity for the current point. If
-ours is larger, something is closer to the sun and we are shadowed. `step(a, b)` returns 1 when `b >= a`:
-
-```glsl
-float lit = step(z, texture2D(s_ShadowMap, uv).r);   // 1 = lit, 0 = shadowed
-```
-
-Before sampling, the undistorted map coordinates `p = s.xy * 2 - 1` are distorted and mapped back to 0..1:
-
-```glsl
-vec2 uv = shadowDistort(p) * 0.5 + 0.5;
-```
-
-Anything outside the map (`|p| >= 1`) is treated as lit, apart from the face check below, and the shadow fades out
-toward the map border:
-
-```glsl
-vec2 c = abs(p);
-float edge = 1.0 - smoothstep(SHADOW_EDGE_FADE, 1.0, max(c.x, c.y));   // SHADOW_EDGE_FADE = 0.85
-```
 
 ---
 
 ## Shadow bias
 
-Taken literally, the comparison above makes surfaces shadow *themselves*: the depth stored for a texel is the depth at
-the texel's centre, but the point you are shading is somewhere else on the same tilted surface, a hair deeper. Half
-the surface passes the test and half fails, which draws stripes. This is **shadow acne**.
+Shadow mapping tests whether a surface point is behind the depth stored in the map. Because a surface rasterized in
+the shadow map has finite resolution and precision, surface fragments can mistakenly self-shadow, creating striped
+artifacts known as "shadow acne".
 
-The fix is to push the point towards the sun before comparing. The example adds up three terms.
+Custom Buffers uses **dynamic slope-scaled depth bias** proportional to each cascade's texel footprint with a stable constant floor:
 
-**1. A constant** (`SHADOW_BIAS`, 0.12 blocks). Covers rounding errors.
+`glsl
+highp float slope = clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 5.0);
+highp float z0 = s.z - (SHADOW_BIAS + texel0 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
+highp float z1 = s.z - (SHADOW_BIAS + texel1 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
+`
 
-**2. A slope term.** How much a surface can disagree with the texel centre depends on how tilted it is against the
-sun and on how big a texel is on that surface:
-
-```glsl
-float texelBlocks = 2.0 * SHADOW_RADIUS / ShadowRes.x * growth;
-float slope = clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 6.0);
-float z = s.z - (SHADOW_BIAS + texelBlocks * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
-```
-
-- `ndl` is the cosine between the face normal and `L`. `sqrt(1 - ndl²) / ndl` is the tangent of the angle: 0 for a face
-  looking straight at the sun, large for a face almost parallel to it.
-- `growth` is how much bigger a texel is here than in an undistorted map (`(r + k)² / (k (1 + k))`, clamped to 6). Far texels are stretched, so they need more bias.
-- Dividing by `2 * SHADOW_DEPTH_RANGE` converts blocks into the 0..1 depth the map stores.
-
-**3. A polygon offset in the mod.** While drawing into the map the mod enables `GL_POLYGON_OFFSET_FILL` with
-`kShadowPolySlope = 2.0` and `kShadowPolyUnits = 4.0` (constants at the top of `src/GlHooks.cpp`). The GPU then pushes
-the *stored* depth slightly away from the sun in proportion to each triangle's slope, which is the hardware version
-of term 2.
-
-| Symptom | Change |
-| --- | --- |
-| Stripes or speckles on lit surfaces | Raise `SHADOW_BIAS` or `SHADOW_SLOPE_BIAS`. |
-| Shadows start away from the object that casts them ("peter panning") | Lower them. |
+SHADOW_BIAS (0.12 blocks) provides a solid constant floor that safely covers the ~10 quantization levels of a 16-bit depth buffer over the 800-block depth range, while SHADOW_SLOPE_BIAS (0.6) scales with each cascade's texel size to prevent acne on slanted geometry.
 
 ---
 
@@ -341,99 +258,42 @@ A face pointing away from the sun is always in shadow, and the map is the wrong 
 compares the face against itself. So the example computes the face normal in the fragment shader and treats such faces
 as shadowed without sampling the map at all.
 
-Chunk vertices have no normals, so the normal comes from how the camera-relative position changes from one pixel to the
-next:
+Chunk vertices have no normals, so the normal comes from screen-space derivatives of the camera-relative position:
 
 ```glsl
-highp vec3 pdx = dFdx(v_rel) * 64.0;
-highp vec3 pdy = dFdy(v_rel) * 64.0;
-highp vec3 n = cross(pdx, pdy);
-highp float nLen = length(n);
-n = (nLen > 0.0) ? n / nLen : vec3(0.0, 1.0, 0.0);
-n = (dot(n, v_rel) > 0.0) ? -n : n;   // turn it towards the camera
-float ndl = dot(n, normalize(v_sun));
+highp vec3 faceNormal(highp vec3 rel) {
+  highp vec3 n = cross(dFdx(rel) * 64.0, dFdy(rel) * 64.0);
+  highp float len = length(n);
+  n = (len > 0.0) ? n / len : vec3(0.0, 1.0, 0.0);
+  return (dot(n, rel) > 0.0) ? -n : n;
+}
 ```
 
-- `v_rel` is the camera-relative position, passed from the vertex shader. The cross product of its two screen-space
-  derivatives is perpendicular to the surface.
-- The `* 64.0` and `highp` keep the tiny per-pixel steps from underflowing on devices with low-precision floats.
-- A visible surface always faces the camera, so the sign is chosen to make `dot(n, v_rel) < 0`.
-
-The face factor then fades smoothly from lit to shadowed as the face turns away:
+- In `RenderChunk/vertex.sc`, `v_rel = worldPos;` supplies the camera-relative vector to the fragment (`u_model` is already camera-relative in Minecraft Bedrock chunk rendering).
+- Using camera-relative coordinates ensures `dot(n, rel) > 0.0` reliably turns back-facing normals toward the camera across the entire world, preventing normal flips across moving camera coordinates.
+- The face factor fades smoothly from lit to shadowed as the face turns away:
 
 ```glsl
 float face = mix(1.0, smoothstep(0.0, SHADOW_FACE_FADE, ndl), s.w);
-if (face <= 0.0) { return 0.0; }             // no map lookups at all
-...
-return min(mix(1.0, lit, edge * s.w), face); // also applies outside the map
+if (face <= 0.0) { return vec3_splat(0.0); }
 ```
-
-Because `face` is also applied outside the map, surfaces turned away from the sun stay dark at any distance; only the
-cast shadows of lit surfaces stop at the border.
 
 ---
 
 ## Soft edges
 
-A single shadow-map sample gives hard, jagged edges because the map has limited resolution. Real shadows also have a
-soft edge (the penumbra). Averaging several samples around the point (percentage-closer filtering) fixes both. This is
-what gives the soft grass shadows in the Iris tutorial's last screenshot.
+Real shadows feature soft penumbra boundaries. Custom Buffers uses a 4-tap PCF filter with cascade boundary clamping to prevent atlas bleeding:
 
-The example takes `SHADOW_TAPS` samples (4 by default) on a spiral (Vogel) disk and rotates the whole disk by a different angle
-for every pixel, so the pattern never lines up into visible bands. To keep it cheap, most pixels use far fewer:
-
-1. **Stage 1** takes every second sample (`SHADOW_TAPS / 2`). If they all agree, the pixel is fully lit or
-   fully shadowed and it stops. This is what most pixels do, near and far.
-2. Only if they disagree (the pixel is on a shadow edge) **stage 2** takes the remaining samples.
-
-The blur is never narrower than about 1.2 texels, so far-away edges, where texels are large, are filtered as well instead
-of staying hard and blocky.
-
-```glsl
-// simplified from shadowLit(): sum of the first half of the taps
-for (int j = 0; j < SHADOW_TAPS / 2; j++) { sum += shadowTap(uv + dir * (d * R), z); /* rotate dir, next d */ }
-if (sum is neither 0 nor SHADOW_TAPS / 2) {      // shadow edge: take the other half
-  ...
-  lit = sum / float(SHADOW_TAPS);
-} else {
-  lit = sum / float(SHADOW_TAPS / 2);
+`glsl
+highp vec3 sampleCascadePCF(highp vec2 uvBase, highp float z, highp vec2 uvMin, highp vec2 uvMax) {
+  highp vec2 stepUV = vec2(0.25 / SHADOW_RES, 0.5 / SHADOW_RES);
+  highp vec3 sum = shadowTap(clamp(uvBase + vec2(-stepUV.x,  stepUV.y), uvMin, uvMax), z);
+  sum += shadowTap(clamp(uvBase + vec2( stepUV.x, -stepUV.y), uvMin, uvMax), z);
+  sum += shadowTap(clamp(uvBase + vec2(-stepUV.x, -stepUV.y), uvMin, uvMax), z);
+  sum += shadowTap(clamp(uvBase + vec2( stepUV.x,  stepUV.y), uvMin, uvMax), z);
+  return sum * 0.25;
 }
-```
-
-Each tap offsets `uv` along a rotating direction at radius `sqrt((i + 0.5) / SHADOW_TAPS)` and compares depths:
-
-```glsl
-return step(z, texture2D(s_ShadowMap, uv + dir * (d * R)).r);   // with colour: see Transparent shadows
-```
-
-The rotation angle comes from *interleaved gradient noise*, a cheap function of the pixel coordinate, so no noise
-texture is needed.
-
-### Blur size in blocks
-
-The penumbra is defined in **blocks**, not texels, so it looks the same near the player and far away even though
-distortion makes texels very different sizes:
-
-```glsl
-float blurTexels = clamp(SHADOW_BLUR * SHADOW_RES / (2.0 * SHADOW_RADIUS * stretch), 1.2, 6.0);
-```
-
-`stretch` is the (unclamped) size of a texel here compared to an undistorted map. Close to the camera a texel is tiny,
-so the same blur needs many texels; far away a texel is already large, so it needs about one. The result is clamped between
-1.2 and 6 texels.
-
-The bias grows with the blur, because samples at the edge of the disk read the map from a different point on a tilted
-surface (see [Shadow bias](#shadow-bias)).
-
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `SHADOW_TAPS` | 4 | **Maximum** samples per pixel (even number). `1` = hard edge, `8`-`16` = smooth. Typical pixels use half of it. |
-| `SHADOW_BLUR` | 0.12 | Penumbra radius in blocks. Larger = softer, more "overcast". |
-
-> **Note** With few taps the per-pixel rotation shows up as fine grain instead of banding. Raising `SHADOW_TAPS` is the
-> fix; there is no frame-to-frame jitter, so it does not shimmer.
-
-The sampler must stay on **Point** filtering; comparing filtered depths gives wrong results.
+`
 
 ---
 
@@ -443,38 +303,58 @@ The fragment shader multiplies the lit colour by a factor between `SHADOW_BRIGHT
 
 ```glsl
 float skyExposure = clamp(v_lightmapUV.y * 1.2, 0.0, 1.0);
-diffuse.rgb *= mix(1.0, mix(SHADOW_BRIGHTNESS, 1.0, lit), skyExposure);
+if (skyExposure > 0.0 && v_shadow.w > 0.0) {
+  highp vec3 sunlight = shadowLit(v_shadow, dot(faceNormal(v_rel), normalize(v_sun)));
+  diffuse.rgb *= mix(vec3_splat(1.0), mix(vec3_splat(SHADOW_BRIGHTNESS), vec3_splat(1.0), sunlight), skyExposure);
+}
 ```
 
-`v_lightmapUV.y` is the game's sky light level for the vertex. Scaling the shadow by it keeps caves and covered areas
-from being darkened a second time: they get no extra shadow where the sun cannot reach anyway. `SHADOW_BRIGHTNESS`
-defaults to 0.55.
+`skyExposure > 0.0` ensures shadows smoothly fade out with the sky lightmap and avoids shadow work when unexposed to the sky.
 
 ---
 
 ## Entities
 
-Entities live in a different material (`Actor`) and are drawn after the terrain. They cast, and receive like the terrain. Include the same
-`utils/shadow.h` and add one branch for the caster pass:
+Entities live in a different material (`Actor`) and are drawn after the terrain. They cast and receive like the terrain. Include the same
+`utils/shadow.h` with `#define SHADOW_RECEIVER 1`.
+
+### Caster pass (`Actor/vertex.sc`)
 
 ```glsl
-if (ShadowPass.x > 0.5) {
-  if (ui) {
-    position = vec4(0.0, 0.0, 2.0, 1.0);   // inventory previews never enter the world map
-  } else {
-    position = shadowCaster(worldPosition - ViewPositionAndTime.xyz, sunDirection());
+#ifdef SHADOW
+  if (ShadowPass.x > 0.5) {
+    v_texcoord0 = texcoord0;
+    v_color0 = a_color0;
+    gl_Position = ui ? vec4(0.0, 0.0, 2.0, 1.0)
+                     : shadowCaster(worldPosition - ViewPositionAndTime.xyz, sunDirection(), ShadowPass.y);
+    return;
   }
-}
+#endif
 ```
 
-Points to know:
+### Receiver pass (`Actor/vertex.sc` & `Actor/fragment.sc`)
 
-- `ui` (`u_proj[3][3] > 0.5`) identifies inventory and paper-doll draws. Without this check they would be drawn into
-  the world shadow map in screen-space coordinates.
-- The map is written this frame but read next frame, so a moving entity's shadow trails it by one frame.
-- The fragment shader uses the same early-out as terrain, keeping the alpha test for cut-out textures.
-- The terrain already reads the shared map, so entity shadows land on the ground without any change to `RenderChunk`.
-- Entities also receive shadows (`shadowLit` in `Actor/fragment.sc`), from the same map.
+In `Actor/vertex.sc`, the normal is transformed into world space and `shadowReceiver()` is called with `v_sun`:
+
+```glsl
+#ifdef SHADOW
+  v_sun = sunDirection();
+  v_normal = normalize(mul(World, vec4(a_normal.xyz, 0.0)).xyz);
+  if (!ui && ShadowPass.x < 0.5) {
+    v_shadow = shadowReceiver(worldPosition - ViewPositionAndTime.xyz, v_sun);
+  }
+#endif
+```
+
+In `Actor/fragment.sc`, the normal is passed directly into `shadowLit()`:
+
+```glsl
+#ifdef SHADOW
+  highp vec3 n = normalize(v_normal);
+  highp vec3 L = normalize(v_sun);
+  albedo.rgb *= mix(vec3_splat(SHADOW_BRIGHTNESS), vec3_splat(1.0), shadowLit(v_shadow, dot(n, L)));
+#endif
+```
 
 ---
 
@@ -484,51 +364,56 @@ Points to know:
 
 | Component | Default | Meaning |
 | --- | --- | --- |
-| `x` | 512 | Shadow map resolution per side. The mod reads it once per frame, clamps it to 256-4096 and recreates the map when it changes. `0`/unset (no `ShadowRes` uniform, or `x` below 1) = 2048. |
-| `y` | 16 | Depth bits of the maps: 16 (default), 24, or 32 (float). `0`/unset = 16. |
+| `x` | 1024 | Shadow map resolution per cascade (clamped 256–4096). |
+| `y` | 16 | Depth bits of the maps: 16 (default), 24, or 32 (float). |
 
-Distortion strength is the constant `SHADOW_DISTORT` (default 0.10, smaller = crisper near you, blurrier far away, `0` = off).
+### `ShadowCull` (uniform default in `uniforms/ShadowCull.json`)
+
+| Component | Default | Meaning |
+| --- | --- | --- |
+| `x` | 64.0 | Far map radius in blocks (`SHADOW_RADIUS`). |
+| `y` | 400.0 | Depth range in blocks (`SHADOW_DEPTH_RANGE`, covers ±400 along `L`). |
+| `z` | 1.0 (`RenderChunk`), 0.0 (`Actor`) | `1` enables chunk culling in the mod, `0` disables. |
 
 ### Constants in the shaders (`utils/shadow.h`)
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `SHADOW_RADIUS` | `ShadowCull.x` (64) | Blocks from the camera to the map edge. Set in `uniforms/ShadowCull.json`; the mod culls with the same value. |
+| `SHADOW_RADIUS_NEAR` | 16.0 | Near cascade radius in blocks (Cascade 0). |
+| `SHADOW_RADIUS` | `ShadowCull.x` (64) | Far cascade radius in blocks (Cascade 1). |
 | `SHADOW_DEPTH_RANGE` | `ShadowCull.y` (400) | Blocks along `L`. |
-| `SHADOW_RES` | `ShadowRes.x` | Map resolution (uniform). |
-| `SHADOW_DISTORT` | 0.10 | Distortion strength, `0` = off. |
-| `SHADOW_BRIGHTNESS` | 0.55 | Brightness inside shadow (1 = no shadows). |
-| `SHADOW_BIAS` | 0.12 | Constant bias in blocks. |
-| `SHADOW_SLOPE_BIAS` | 0.6 | Slope-scaled bias strength. |
-| `SHADOW_TAPS` | 4 | Maximum samples per pixel. |
-| `SHADOW_BLUR` | 0.12 | Penumbra radius in blocks. |
-| `SHADOW_FACE_FADE` | 0.15 | How quickly a face darkens as it turns from the sun. |
-| `SHADOW_EDGE_FADE` | 0.85 | Where, as a fraction of the radius, the shadow fades out. |
-| `SHADOW_GLASS_TINT` / `SHADOW_GLASS_DARK` | 0.85 / 0.30 | Strength of the colour and the constant darkening of light through glass or water. |
-| `SHADOW_TRANSPARENT_RECEIVE` | 0 | `1` = glass and water also receive shadows (more lookups). |
-| `SHADOW_COLORED` | 1 | `0` turns coloured shadows off (saves two samplers). |
-| `SHADOW_SUN_STEP`, `SHADOW_SUN_GLIDE` | 0.5, 0 | Sun stepping (see [Stepping the sun](#stepping-the-sun)). |
+| `SHADOW_RES` | `ShadowRes.x` | Map resolution per cascade (uniform, default 1024). |
+| `SHADOW_BRIGHTNESS` | 0.55 | Brightness inside shadow. |
+| `SHADOW_BIAS` | 0.06 | Depth bias floor in blocks. |
+| `SHADOW_SLOPE_BIAS` | 0.5 | Dynamic slope-scaled bias multiplier. |
+| `SHADOW_TAPS` | 4 | Poisson disk sample count per pixel. |
+| `SHADOW_PENUMBRA` | 0.15 | Penumbra base scale in blocks. |
+| `SHADOW_FACE_FADE` | 0.15 | Darkening rate on back-facing slopes. |
+| `SHADOW_EDGE_FADE` | 0.85 | Fraction of radius where shadow fades out. |
+| `SHADOW_GLASS_TINT` / `SHADOW_GLASS_DARK` | 0.85 / 0.30 | Colour strength and constant glass dimming. |
+| `SHADOW_TRANSPARENT_RECEIVE` | 0 | `1` = glass and water also receive shadows. |
+| `SHADOW_COLORED` | 1 | `0` turns coloured shadows off. |
+| `SHADOW_SUN_STEP`, `SHADOW_SUN_GLIDE` | 0.5, 0.0 | Degrees per sun step and transition easing. |
+| `SHADOW_DEBUG_FREEZE_SUN` | -1.0 | Fixed sun angle for debugging (-1 = normal time of day). |
 | `SHADOW_SUN_FADE` | `vec2(0.10, 0.35)` | Sun height where shadows fade in. |
 
-### Constants in the mod (`src/GlHooks.cpp`, needs a rebuild)
+### Constants in the mod (`src/GlHooks.cpp`)
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `kShadowSize` | 2048 | Fallback resolution when the material has no `ShadowRes`. |
-| `kShadowSizeMin` / `kShadowSizeMax` | 256 / 4096 | Clamp for `ShadowRes.x`. |
-| `kShadowFormat` | `GL_DEPTH_COMPONENT16` | Depth texture format. |
-| `kShadowPolySlope` / `kShadowPolyUnits` | 2.0 / 4.0 | Polygon offset while rendering the map. |
+| `kShadowSize` | 1024 | Fallback resolution per cascade when material omits `ShadowRes`. |
+| `kShadowSizeMin` / `kShadowSizeMax` | 256 / 4096 | Clamping bounds for resolution. |
+| `kShadowFormat` | `GL_DEPTH_COMPONENT16` | Default depth format. |
+| `kShadowPolySlope` / `kShadowPolyUnits` | 2.0 / 4.0 | Caster polygon offset. |
 
 ---
 
 ## Performance
 
-- Every caster draw is issued twice. This is the main cost; the second draw is depth-only and the fragment shader
-  returns immediately, so it is mostly vertex work.
-- Memory is two depth textures: `2 × size² × 2` bytes at 16 bit (the default), about 4 MB at 1024 and 16 MB at 2048 (double at 24 bit and at 32 bit float, which is the same size as 24 bit).
-- Lower `ShadowRes.x` before anything else; distortion keeps the area near the player sharp even at 1024.
-- Faces turned away from the sun skip the map lookups completely. Each tap is one texture read. Lit or fully shadowed pixels use `SHADOW_TAPS / 2`, and only shadow edges use all of them.
-- Only chunks the game already draws this frame cast, so shadows from off-screen geometry are missing.
+- 2-Cascade Shadow Mapping provides 32 texels/block resolution near the camera while using a compact $2048 	imes 1024$ atlas.
+- 16-bit depth textures (`GL_DEPTH_COMPONENT16`) require only 4 MB VRAM total for both cascades, minimizing memory bandwidth.
+- Chunk culling tests chunk bounding boxes against the shadow map volume, skipping terrain draws outside the map before vertex execution.
+- `skyExposure > 0.0` and `v_shadow.w > 0.0` skip shadow evaluation entirely when underground or outside map boundaries.
 
 ---
 
@@ -536,24 +421,19 @@ Distortion strength is the constant `SHADOW_DISTORT` (default 0.10, smaller = cr
 
 | Problem | Likely cause and fix |
 | --- | --- |
-| No shadows at all | The material has no `ShadowPass` in the opaque pass (nothing casts), or `s_ShadowMap` is not declared in the receiver. |
-| Shadows only appear after a moment | The map is white until the first frame is ready. Expected. |
-| Stripes on surfaces | Shadow acne. Raise `SHADOW_BIAS` or `SHADOW_SLOPE_BIAS`. |
-| Stripes on sides facing away from the sun | The face normal (from screen-space derivatives) is not working on that device. |
-| Shadows float away from objects | Bias is too high. Lower `SHADOW_BIAS` or `SHADOW_SLOPE_BIAS`. |
-| Terrain and entity shadows disagree | `ShadowCull.json` (radius, depth range) or `ShadowRes.json` differ between the two materials. |
-| Shadows shimmer when walking | Snapping broke: check that `ShadowRes.x` is the same everywhere and that `LastCameraPosition` is mapped in `material.json`. |
-| Shadow edges crawl while the sun moves | `SHADOW_SUN_GLIDE` is above 0. Set it to 0 for hard steps. |
-| A moving entity's shadow trails slightly | The map is read one frame late; expected. |
-| Blobs or wobbling shapes near the player | Distortion is too strong (`SHADOW_DISTORT` too small) for the geometry. Raise `SHADOW_DISTORT`. |
-| Shadows grainy | Too few taps for the blur size. Raise `SHADOW_TAPS` or lower `SHADOW_BLUR`. |
-| Shadows too blurry far away | Distortion trades far for near. Raise `SHADOW_DISTORT` or the resolution. |
-| Inventory preview shadows appear in the world | The `ui` check is missing from the entity caster branch. |
+| No shadows at all | Check that `ShadowPass` exists in the opaque pass and `s_ShadowMap` is bound. |
+| Shadows only appear after a moment | The map is double-buffered; the first frame initializes the buffers. |
+| Half of the world flickers dark | Ensure `v_rel = worldPos;` in `RenderChunk/vertex.sc` is camera-relative (`u_model` is camera-relative in Bedrock) so `faceNormal` doesn't invert across moving player coordinates. |
+| Stripes or self-shadowing acne | Raise `SHADOW_SLOPE_BIAS` (default 0.6) or `SHADOW_BIAS` (default 0.12). |
+| Shadows float away from objects | `SHADOW_BIAS` is too high. Lower it towards 0.12. |
+| Shadows shimmer when walking | Snapping mismatch: verify that `ShadowCull.x` matches between materials and `LastCameraPosition` is mapped in `material.json`. |
+| Shadows grainy | Check `SHADOW_TAPS`. Default 4-tap Poisson provides clean, grain-free filtering. |
 
+---
 
 ## Transparent shadows (coloured shadows from glass and water)
 
-The same split Iris/OptiFine use (`shadowtex0` / `shadowtex1` / `shadowcolor0`). Three samplers, all optional:
+The same split Iris/OptiFine use (`shadowtex0` / `shadowtex1` / `shadowcolor0`):
 
 | Sampler | Contents | Iris name |
 | --- | --- | --- |
@@ -561,71 +441,33 @@ The same split Iris/OptiFine use (`shadowtex0` / `shadowtex1` / `shadowcolor0`).
 | `s_ShadowAll` | depth of **all** casters, opaque + transparent | `shadowtex0` |
 | `s_ShadowColor` | RGBA written by the nearest of those casters (`RGBA8`) | `shadowcolor0` |
 
-A program that declares the uniform `ShadowTransparentPass` (`vec4`, see `ShadowTransparentPass.json`) is a **transparent caster**.
-The mod redraws it with `ShadowTransparentPass.x = 1` into the all-casters map only. Its fragment shader should write
-`texture * vertexColor` (alpha = how much light it blocks) and discard nearly invisible texels, like `shadow.fsh` in Iris.
-Opaque casters (`ShadowPass`) keep working as before; their colour output is ignored, write `vec4(1, 1, 1, 0)`.
-
-How it works:
-
-- The first time a transparent caster is drawn in a frame, the mod copies the opaque depth into the all-casters depth
-  (one `glBlitFramebuffer`) and clears its colour to white with alpha 0. Opaque casters are therefore not drawn a third time.
-- An opaque caster that is drawn after that point is added to both maps, so the all-casters depth stays complete.
-- Transparent casters use depth test `LESS` with depth writes, so each texel keeps the nearest caster's colour. Blending and the
-  colour mask are switched off while drawing and restored afterwards.
-- Receivers read the previous frame's maps like before. In a frame without transparent casters `s_ShadowAll` is bound to the
-  opaque map (they are identical) and `s_ShadowColor` to white, so opaque shadows never disappear.
-
-Receiver logic (per sample, same as the Iris guide):
+A program that declares `ShadowTransparentPass` is a **transparent caster**. The mod redraws it into the all-casters map.
 
 ```glsl
-if (step(z, texture2D(s_ShadowAll, uv).r) > 0.5) return vec3(1.0);   // nothing in the way
-if (step(z, texture2D(s_ShadowMap, uv).r) < 0.5) return vec3(0.0);   // opaque in the way
-vec4 c = texture2D(s_ShadowColor, uv);                               // only glass / water in the way
-vec3 hue = c.rgb / max(max(c.r, max(c.g, c.b)), 0.001);              // the example uses only the hue, not per-pixel alpha
-return mix(vec3(1.0), hue, SHADOW_GLASS_TINT) * (1.0 - SHADOW_GLASS_DARK);
+if (step(z, texture2D(s_ShadowAll, uv).r) > 0.5) { return vec3_splat(1.0); }
+if (step(z, texture2D(s_ShadowMap, uv).r) < 0.5) { return vec3_splat(0.0); }
+highp vec4 c = texture2D(s_ShadowColor, uv);
+highp vec3 hue = c.rgb / max(max(c.r, max(c.g, c.b)), 0.001);
+return mix(vec3_splat(1.0), hue, SHADOW_GLASS_TINT) * (1.0 - SHADOW_GLASS_DARK);
 ```
 
-Memory: the all-casters map adds an `RGBA8` colour texture and a depth texture (16 bit by default, see `ShadowRes.y`) per buffer, twice
-(6 bytes per texel x 2 at 16 bit, 8 at 24 bit). At 1024 and 16 bit that is 12 MB, at 2048 it is 48 MB. It is only allocated when a program declares
-`ShadowTransparentPass`. If creating it fails, opaque shadows keep working and only the coloured shadows are lost.
-
-
-## Cost of a caster draw
-
-Every caster draw is issued twice (the second one into the shadow map), so the shadow pass costs roughly one more
-geometry pass plus a framebuffer switch per draw. What the mod does to keep the overhead of that small:
-
-- It only changes GL state that differs from what the game has (usually just viewport, depth function and polygon offset)
-  and restores exactly that. During chunk draws this brings a caster draw from 35 to 25 GL calls (measured with the fake
-  GL in `tests/fake_gl_test.cpp`, including the game's own draw and the sampler binds).
-- It no longer queries the read framebuffer per draw (only the once-per-frame depth copy touches it) and no longer calls
-  `glGetError` after every draw (only for the first 240 casts after the maps are created).
-- Draws with no vertices or no instances are not repeated.
-- `ShadowRes.y = 16` (the default) halves the memory and bandwidth of every shadow texture compared to 32 bit (at 2048: 8 MB instead of 16 MB each).
-  Depth steps become 1/65536 of `SHADOW_DEPTH_RANGE * 2` (about 0.012 blocks), so keep `SHADOW_BIAS` at 0.12 or higher.
-- The all-casters map is only created when a transparent caster exists, and the opaque depth is copied into it once per
-  frame instead of drawing the opaque casters a third time.
-
-What it cannot remove: the second geometry pass and the framebuffer switch. Cutting those needs the map to be rebuilt only
-every few frames (the receiver would then need the camera and sun direction of the frame that built the map).
-
+---
 
 ## Chunk culling (ShadowCull)
 
-Like OptiFine's shadow frustum, the mod skips the second (shadow) draw of a terrain chunk that lies completely outside the
-shadow map. The hardware would clip all of its triangles anyway, but only after the vertex shader ran for every vertex.
+The mod skips the shadow redraw of terrain chunks whose bounding box lies completely outside the shadow volume.
 
-Opt-in per material with the uniform `ShadowCull` (`vec4`, see `uniforms/ShadowCull.json`):
+Opt-in per material via the uniform `ShadowCull` (`vec4`):
 
-| Component | Meaning |
-| --- | --- |
-| `x` | map radius in blocks. Use it in the shader as `SHADOW_RADIUS`, so mod and shader always agree |
-| `y` | depth range in blocks (`SHADOW_DEPTH_RANGE`) |
-| `z` | `1` = cull this program's draws (terrain), `0` = off (entities: the mod does not know their size) |
+| Component | Default | Meaning |
+| --- | --- | --- |
+| `x` | 64.0 | Map radius in blocks (`SHADOW_RADIUS`). |
+| `y` | 400.0 | Depth range in blocks (`SHADOW_DEPTH_RANGE`, covers ±400 along `L`). |
+| `z` | 1.0 (`RenderChunk`), 0.0 (`Actor`) | `1` = cull terrain draws outside the map volume, `0` = off. |
+| `w` | 0.0 | Unused. |
 
-How it decides: it reads the chunk's `u_model` translation (relative to the camera, like the caster maths), builds the sun
-direction from `GameTimeOfDay`, and tests the chunk's box against the map square in light space with a margin of
-`16 + 0.1 * radius` blocks (texel snapping, sun stepping up to about 5 degrees, chunk size). Instanced draws, programs
-without `u_model`, and matrices that are not a plain translation are never culled. Cost: one `glGetUniformfv` per chunk
-draw, plus two per program per frame.
+The mod tests the chunk's box against the map square in light space with a margin of `16 + 0.1 * radius` blocks:
+- $cx = z + 8.0$ (light-space right)
+- $cy = (x + 8.0) \cdot L_y - (y + 8.0) \cdot L_x$ (light-space up)
+
+Chunks outside the map volume limit c.limit ( + 16 + 6.4 \approx 86.4\text{ blocks}$) are skipped before issuing vertex shading. Chunks within the volume are drawn into both cascade viewports, where GPU hardware viewport clipping efficiently discards out-of-bounds triangles without caster pop-in.

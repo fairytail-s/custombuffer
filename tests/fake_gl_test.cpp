@@ -151,7 +151,7 @@ int main(){
     useProgramDetour(7); fake::calls.clear(); fake::shadowDraws=0;
     unsigned fr0=state().frame;
     drawElementsDetour(4,6,0x1403,nullptr);   // first caster draw of the frame
-    CHECK(fake::shadowDraws==1);                                   // drawn a second time with ShadowPass=1
+    CHECK(fake::shadowDraws==2);                                   // drawn a second time with ShadowPass=1
     CHECK(fake::shadowDrawFbo!=2 && fake::shadowDrawFbo>=10);      // into our own framebuffer
     CHECK(fake::shadowDrawVp==kShadowSize);                        // at shadow resolution
     CHECK(fake::shadowPassVal==0);                                 // ShadowPass back to 0
@@ -160,7 +160,7 @@ int main(){
     CHECK(fake::bound[4]==66 && fake::active==0);                  // game's texture restored
     CHECK(fake::calls["Clear"]==1);
     drawElementsDetour(4,6,0x1403,nullptr);   // second draw, same frame: no second clear
-    CHECK(fake::calls["Clear"]==1 && fake::shadowDraws==2);
+    CHECK(fake::calls["Clear"]==1 && fake::shadowDraws==4);
     CHECK(!state().sh.readValid);                                  // first frame: receivers still get the white fallback
     const int w0=state().sh.write; unsigned tex0=state().sh.tex[w0];
     { State& st=state(); endFrame(st); }
@@ -266,17 +266,17 @@ int main(){
       if(layoutA){ fake::modelM[12]=x; fake::modelM[13]=y; fake::modelM[14]=z; } else { fake::modelM[3]=x; fake::modelM[7]=y; fake::modelM[11]=z; } };
     useProgramDetour(10);
     auto drawn=[&]{ fake::shadowDraws=0; drawElementsDetour(4,6,0x1403,nullptr); return fake::shadowDraws; };
-    setT(0,0,0,true);        CHECK(drawn()==1);   // chunk at the camera is cast
-    setT(32,-16,-32,true);   CHECK(drawn()==1);   // inside the 64 block map
+    setT(0,0,0,true);        CHECK(drawn()==2);   // chunk at the camera is cast
+    setT(32,-16,-32,true);   CHECK(drawn()==2);   // inside the 64 block map
     setT(0,0,200,true);      CHECK(drawn()==0);   // far outside in light-space "right"
     setT(-200,0,0,true);     CHECK(drawn()==0);   // far outside in light-space "up"
-    setT(0,300,0,true);      CHECK(drawn()==1);   // far above only: stays (height is along the sun, handled by depth clipping)
+    setT(0,300,0,true);      CHECK(drawn()==2);   // far above only: stays (height is along the sun, handled by depth clipping)
     setT(0,0,200,false);     CHECK(drawn()==0);   // other matrix layout, same result
-    setT(0,0,0,false);       CHECK(drawn()==1);
-    fake::modelM[0]=0.0625f; setT(0,0,200,true); fake::modelM[0]=0.0625f; CHECK(drawn()==1);   // scaled matrix: not understood, never culled
-    fake::modelM[0]=1.0f; fake::modelM[12]=0; fake::modelM[13]=0; fake::modelM[14]=200; fake::modelM[3]=5.0f; CHECK(drawn()==1);   // both layouts nonzero: never culled
+    setT(0,0,0,false);       CHECK(drawn()==2);
+    fake::modelM[0]=0.0625f; setT(0,0,200,true); fake::modelM[0]=0.0625f; CHECK(drawn()==2);   // scaled matrix: not understood, never culled
+    fake::modelM[0]=1.0f; fake::modelM[12]=0; fake::modelM[13]=0; fake::modelM[14]=200; fake::modelM[3]=5.0f; CHECK(drawn()==2);   // both layouts nonzero: never culled
     { State& st=state(); endFrame(st); }
-    fake::cullZ=0.0f; setT(0,0,200,true); CHECK(drawn()==1);   // z = 0 turns culling off (new frame re-reads the uniform)
+    fake::cullZ=0.0f; setT(0,0,200,true); CHECK(drawn()==2);   // z = 0 turns culling off (new frame re-reads the uniform)
     // an instanced draw is never culled
     fake::cullZ=1.0f; { State& st=state(); endFrame(st); } setT(0,0,200,true);
     fake::shadowDraws=0; fake::calls.clear(); drawElementsInstancedDetour(4,6,0x1403,nullptr,4); CHECK(fake::calls["GetUniformfv"]<=1);
