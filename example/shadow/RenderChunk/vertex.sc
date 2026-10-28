@@ -46,7 +46,6 @@ void main() {
   uv0 = fract(uv0) + ((floor(uv0)-0.5)/16384.0);
 
   #if defined(SHADOW) || defined(SHADOW_TRANSPARENT)
-    // Caster pass: only position, uv and colour are needed. Skip fog, lightmap and the receiver maths.
     #if defined(SHADOW)
       bool casting = ShadowPass.x > 0.5;
     #else
@@ -55,7 +54,7 @@ void main() {
     if (casting) {
       v_color0 = color;
       v_texcoord0 = uv0;
-      gl_Position = shadowCaster(worldPos, sunDirection());
+      gl_Position = shadowCaster(worldPos, sunDirection(), ShadowPass.x > 0.5 ? ShadowPass.y : ShadowTransparentPass.y);
       return;
     }
   #endif
@@ -72,12 +71,12 @@ void main() {
 
   gl_Position = position;
 
-  v_shadow = vec4(0.0, 0.0, 1.0, 0.0);   // w = 0: no shadow lookup
+  v_shadow = vec4(0.0, 0.0, 1.0, 0.0);
   v_rel = worldPos;
   v_sun = vec3(0.0, 1.0, 0.0);
   #ifdef SHADOW_RECEIVE
     vec3 L = sunDirection();
     v_sun = L;
-    v_shadow = shadowReceiver(worldPos, L);   // receiver: where this vertex lands in the map
+    v_shadow = shadowReceiver(worldPos, L);
   #endif
 }

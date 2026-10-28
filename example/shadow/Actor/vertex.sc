@@ -41,12 +41,10 @@ void main() {
 
   #ifdef SHADOW
     if (ShadowPass.x > 0.5) {
-      // caster pass: inventory previews never enter the world map. Only position, uv and colour are needed,
-      // so skip lighting, fog and the receiver maths.
       v_texcoord0 = texcoord0;
       v_color0 = a_color0;
       gl_Position = ui ? vec4(0.0, 0.0, 2.0, 1.0)
-                       : shadowCaster(worldPosition - ViewPositionAndTime.xyz, sunDirection());
+                       : shadowCaster(worldPosition - ViewPositionAndTime.xyz, sunDirection(), ShadowPass.y);
       return;
     }
   #endif
@@ -66,7 +64,7 @@ void main() {
     v_fog = fog;
     v_light = light;
 
-    v_shadow = vec4(0.0, 0.0, 1.0, 0.0);   // w = 0: no shadow lookup
+    v_shadow = vec4(0.0, 0.0, 1.0, 0.0);
     v_sun = vec3(0.0, 1.0, 0.0);
     v_normal = vec3(0.0, 1.0, 0.0);
     #ifdef SHADOW
