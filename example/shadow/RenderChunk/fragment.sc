@@ -14,7 +14,6 @@ $input v_texcoord0, v_color0, v_fog, v_lightmapUV, v_shadow, v_rel, v_sun
 #define SHADOW_RECEIVER 1
 #include <utils/shadow.h>
 
-// Face normal from screen-space derivatives (chunk vertices have no normals), turned towards the camera.
 highp vec3 faceNormal(highp vec3 rel) {
   highp vec3 n = cross(dFdx(rel) * 64.0, dFdy(rel) * 64.0);
   highp float len = length(n);
@@ -25,7 +24,6 @@ highp vec3 faceNormal(highp vec3 rel) {
 void main() {
   #ifndef DEPTH_ONLY_OPAQUE
     #if defined(SHADOW) && !defined(ALPHA_TEST)
-      // opaque shadow-map redraw: only depth matters (colour = "nothing"), skip the texture fetch too
       if (ShadowPass.x > 0.5) {
         gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);
         return;
@@ -39,7 +37,6 @@ void main() {
     #endif
 
     #if defined(SHADOW) && defined(ALPHA_TEST)
-      // alpha-tested shadow-map redraw: the cut-out test above was needed, now only depth matters
       if (ShadowPass.x > 0.5) {
         gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);
         return;
@@ -47,7 +44,6 @@ void main() {
     #endif
 
     #ifdef SHADOW_TRANSPARENT
-      // transparent shadow-map redraw (like shadow.fsh in Iris): write texture * vertex colour, alpha = how much it blocks
       if (ShadowTransparentPass.x > 0.5) {
         vec4 caster = diffuse * v_color0;
         if (caster.a < 0.1) { discard; }
@@ -67,9 +63,8 @@ void main() {
     diffuse.rgb *= texture2D(s_LightMapTexture, v_lightmapUV).xyz;
 
     #ifdef SHADOW_RECEIVE
-      float skyExposure = clamp(v_lightmapUV.y * 1.2, 0.0, 1.0);   // caves keep their own light
-      if (skyExposure > 0.0 && v_shadow.w > 0.0) {                 // caves and night: no normal, no map lookups
-        // sunlight per colour channel: 1 = lit, 0 = shadow, tinted when it passed through glass or water
+      float skyExposure = clamp(v_lightmapUV.y * 1.2, 0.0, 1.0);
+      if (skyExposure > 0.0 && v_shadow.w > 0.0) {
         highp vec3 sunlight = shadowLit(v_shadow, dot(faceNormal(v_rel), normalize(v_sun)));
         diffuse.rgb *= mix(vec3_splat(1.0), mix(vec3_splat(SHADOW_BRIGHTNESS), vec3_splat(1.0), sunlight), skyExposure);
       }

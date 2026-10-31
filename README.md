@@ -48,15 +48,16 @@ The mod redraws the world from the sun into a depth map and gives it back to mat
 | `ShadowPass` (`vec4`) | opaque casters | `x = 1` while the mod redraws that program into the map |
 | `ShadowTransparentPass` (`vec4`) | transparent casters (glass, water) | same, into the coloured all-casters map |
 | `s_ShadowMap`, `s_ShadowAll`, `s_ShadowColor` | receivers | opaque depth, all-casters depth, colour of the nearest caster |
-| `ShadowRes` (`vec4`) | casters | `x` = texels per side (256-4096, default 2048 if unset), `y` = depth bits (16 default, 24, 32 = float) |
-| `ShadowCull` (`vec4`) | terrain casters | `x` = map radius in blocks, `y` = depth range, `z = 1` skips chunk draws outside the map |
+| `ShadowRes` (`vec4`) | casters | `x` = texels per side per cascade (256-4096, default 1024 if unset), `y` = depth bits (16 default, 24, 32 = float) |
+| `ShadowCull` (`vec4`) | terrain casters | `x` = map radius in blocks (default 64), `y` = depth range (default 400), `z = 1` skips chunk draws outside the map |
 
-- Every caster draw is issued twice; the second one is depth-only. Only chunks the game already draws this frame cast.
+- Every caster draw is issued into the shadow atlas; chunks outside the map volume are culled automatically.
 - Receivers read the map finished in the **previous** frame, so use `LastCameraPosition` to line up with it.
-- Distortion and sun direction are done in the material, not the mod.
+- 2-Cascade Shadow Mapping (CSM) uses stabilized linear orthographic projection (Filament / MJP standard) with a 2-tile atlas:
+  - Cascade 0 (near, 16 blocks radius): 32 texels/block at 1024 resolution for razor-sharp contact shadows.
+  - Cascade 1 (far, 64 blocks radius): 8 texels/block covering the full 64-block view distance.
+- Soft shadow edges use 4-tap PCF with smooth cascade blending and dynamic slope bias.
 - The depth format fallback and polygon-offset bias are constants at the top of `src/GlHooks.cpp`.
-
-> **Known issue** The sun direction and the shadow movement while the sun is moving are still a bit buggy: shadows can flicker, jump or shift slightly as the time of day changes. Hard sun steps (`SHADOW_SUN_STEP`, `SHADOW_SUN_GLIDE = 0`) reduce it but do not remove it.
 
 ## Build
 
