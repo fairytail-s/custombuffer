@@ -73,10 +73,10 @@ constexpr int kEglDraw = 0x3059;
 // of the PREVIOUS frame (double buffered), so receivers never read a half-built map.
 // Resolution comes from the material: the uniform "ShadowRes" (vec4: x = texels per side, y = depth bits, z/w unused) of the caster
 // program, read once per frame. The map is recreated whenever it changes. Without that uniform: the default.
-constexpr int kShadowSize = 2048;                 // default texels per side
+constexpr int kShadowSize = 1024;                 // default texels per side
 constexpr int kShadowSizeMin = 256, kShadowSizeMax = 4096;
 constexpr GLenum kShadowFormat = GL_DEPTH_COMPONENT16;   // default (ShadowRes.y unset / 0); ShadowRes.y = 24 or 32 picks DEPTH_COMPONENT24 / 32F
-constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 4.0f;  // slope-scaled depth bias while casting
+constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 8.0f;  // slope-scaled depth bias while casting
 constexpr int kTrackedUnits = 32;
 constexpr unsigned kRevalidateFrames = 60;
 constexpr unsigned kVerifyMask = 1023;
@@ -730,7 +730,7 @@ bool ensureShadow(State& st, int size) {
         real.GenTextures(1, &sh.tex[i]);
         real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
         real.BindTexture(GL_TEXTURE_2D, sh.tex[i]);
-        real.TexStorage2D(GL_TEXTURE_2D, 1, sh.format, size, size);
+        real.TexStorage2D(GL_TEXTURE_2D, 1, sh.format, size * 3, size);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -769,7 +769,7 @@ bool ensureAllCasters(State& st) {
             real.GenTextures(1, &tex);
             real.ActiveTexture(GL_TEXTURE0 + kScratchUnit);
             real.BindTexture(GL_TEXTURE_2D, tex);
-            real.TexStorage2D(GL_TEXTURE_2D, 1, format, sh.size, sh.size);
+            real.TexStorage2D(GL_TEXTURE_2D, 1, format, sh.size * 3, sh.size);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             real.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -827,7 +827,7 @@ bool cullsOutsideMap(State& st, GLuint program, const Units* units, bool instanc
         c.lx = -std::sin(a);
         c.ly = std::cos(a);
         if (!(c.ly > 0.0f)) { c.lx = -c.lx; c.ly = -c.ly; }
-        c.limit = p[0] + 16.0f + 0.1f * p[0];   // radius + texel snap + sun angle error + slack
+        c.limit = p[0] * 1.5f + 32.0f;
     }
     if (!c.on) return false;
     float m[16];
@@ -842,7 +842,7 @@ bool cullsOutsideMap(State& st, GLuint program, const Units* units, bool instanc
     if (zeroA) { x = m[12]; y = m[13]; z = m[14]; }
     else if (zeroB) { x = m[3]; y = m[7]; z = m[11]; }
     else return false;
-    constexpr float kHalf = 16.0f;   // generous half size of a chunk box around origin + 8 (a 16 block chunk)
+    constexpr float kHalf = 32.0f;
     const float cx = z + 8.0f;                              // light space "right" = (0, 0, 1)
     const float cy = (x + 8.0f) * c.ly - (y + 8.0f) * c.lx; // light space "up" = (ly, -lx, 0)
     const float ey = kHalf * (std::fabs(c.lx) + std::fabs(c.ly));
@@ -919,32 +919,37 @@ void castShadow(const Bind& bind, bool instanced, Redraw&& redraw) {
         real.ClearDepthf(clearDepth);
     }
 
-    // draws into the all-casters map: opaque colour output must not be blended, masked or alpha-tested away
+    auto drawCascade = [&](int cascade, GLint passLoc) {
+        real.Viewport(cascade * sh.size, 0, sh.size, sh.size);
+        real.Uniform4f(passLoc, 1.0f, static_cast<float>(cascade), 0.0f, 0.0f);
+        redraw();
+    };
+
     auto drawAll = [&](GLint passLoc) {
         real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
         real.Disable(GL_BLEND);
         real.ColorMask(1, 1, 1, 1);
-        real.Uniform4f(passLoc, 1.0f, 0.0f, 0.0f, 0.0f);
-        redraw();
+        drawCascade(0, passLoc);
+        drawCascade(1, passLoc);
+        drawCascade(2, passLoc);
         real.Uniform4f(passLoc, 0.0f, 0.0f, 0.0f, 0.0f);
     };
 
     if (opaque) {
         real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.fbo[sh.write]);
-        real.Uniform4f(units->shadowPassLoc, 1.0f, 0.0f, 0.0f, 0.0f);
-        redraw();
+        drawCascade(0, units->shadowPassLoc);
+        drawCascade(1, units->shadowPassLoc);
+        drawCascade(2, units->shadowPassLoc);
         real.Uniform4f(units->shadowPassLoc, 0.0f, 0.0f, 0.0f, 0.0f);
-        // opaque caster that comes after the first transparent one: keep the all-casters depth complete
         if (colour) drawAll(units->shadowPassLoc);
     } else {
         if (sh.allFrame != st.frame) {
             sh.allFrame = st.frame;
-            // start of the all-casters map: depth = every opaque caster drawn so far, colour = "nothing" (white, alpha 0)
-            GLint readFbo = 0;   // only this once-per-frame copy touches the read binding
+            GLint readFbo = 0;
             real.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
             real.BindFramebuffer(GL_READ_FRAMEBUFFER, sh.fbo[sh.write]);
             real.BindFramebuffer(GL_DRAW_FRAMEBUFFER, sh.allFbo[sh.write]);
-            real.BlitFramebuffer(0, 0, sh.size, sh.size, 0, 0, sh.size, sh.size, GL_DEPTH_BUFFER_BIT, static_cast<GLenum>(GL_NEAREST));
+            real.BlitFramebuffer(0, 0, sh.size * 3, sh.size, 0, 0, sh.size * 3, sh.size, GL_DEPTH_BUFFER_BIT, static_cast<GLenum>(GL_NEAREST));
             real.BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFbo));
             real.ColorMask(1, 1, 1, 1);
             real.ClearColor(1.0f, 1.0f, 1.0f, 0.0f);

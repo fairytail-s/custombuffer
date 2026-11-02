@@ -151,7 +151,7 @@ int main(){
     useProgramDetour(7); fake::calls.clear(); fake::shadowDraws=0;
     unsigned fr0=state().frame;
     drawElementsDetour(4,6,0x1403,nullptr);   // first caster draw of the frame
-    CHECK(fake::shadowDraws==1);                                   // drawn a second time with ShadowPass=1
+    CHECK(fake::shadowDraws==3);                                   // drawn a second time with ShadowPass=1
     CHECK(fake::shadowDrawFbo!=2 && fake::shadowDrawFbo>=10);      // into our own framebuffer
     CHECK(fake::shadowDrawVp==kShadowSize);                        // at shadow resolution
     CHECK(fake::shadowPassVal==0);                                 // ShadowPass back to 0
@@ -160,7 +160,7 @@ int main(){
     CHECK(fake::bound[4]==66 && fake::active==0);                  // game's texture restored
     CHECK(fake::calls["Clear"]==1);
     drawElementsDetour(4,6,0x1403,nullptr);   // second draw, same frame: no second clear
-    CHECK(fake::calls["Clear"]==1 && fake::shadowDraws==2);
+    CHECK(fake::calls["Clear"]==1 && fake::shadowDraws==6);
     CHECK(!state().sh.readValid);                                  // first frame: receivers still get the white fallback
     const int w0=state().sh.write; unsigned tex0=state().sh.tex[w0];
     { State& st=state(); endFrame(st); }
@@ -174,7 +174,7 @@ int main(){
     // resolution comes from the material's ShadowRes.x and is applied once per frame
     { useProgramDetour(7); fake::settingsX=1024.0f; { State& st=state(); endFrame(st); } fake::shadowDraws=0;
       drawElementsDetour(4,6,0x1403,nullptr);
-      CHECK(state().sh.size==1024 && fake::shadowDrawVp==1024 && fake::shadowDraws==1);   // maps recreated at the new size
+      CHECK(state().sh.size==1024 && fake::shadowDrawVp==1024 && fake::shadowDraws==3);   // maps recreated at the new size
       CHECK(!state().sh.readValid);                                                       // old-size map is never read
       fake::settingsX=99999.0f; { State& st=state(); endFrame(st); }
       drawElementsDetour(4,6,0x1403,nullptr);
@@ -194,7 +194,7 @@ int main(){
     useProgramDetour(8);
     drawElementsDetour(4,6,0x1403,nullptr);   // first transparent caster of the frame
     State& st=state();
-    CHECK(fake::shadowDraws==1 && fake::castFbos.size()==1);                       // one extra draw, no opaque one
+    CHECK(fake::shadowDraws==3 && fake::castFbos.size()==3);                       // one extra draw, no opaque one
     CHECK(fake::castFbos[0]==(int)st.sh.allFbo[st.sh.write]);                      // into the all-casters framebuffer
     CHECK(fake::calls["BlitFramebuffer"]==1);                                      // opaque depth copied into it
     CHECK(fake::calls["Clear"]==2);                                                // opaque depth cleared + colour cleared
@@ -202,16 +202,16 @@ int main(){
     CHECK(fake::drawFbo==2 && fake::readFbo==3 && fake::vp[2]==2400);              // draw/read framebuffer + viewport restored
     CHECK(fake::blendOn==1);                                                       // game's blending restored
     drawElementsDetour(4,6,0x1403,nullptr);   // second transparent caster, same frame
-    CHECK(fake::calls["BlitFramebuffer"]==1 && fake::calls["Clear"]==2 && fake::shadowDraws==2);   // map started only once
+    CHECK(fake::calls["BlitFramebuffer"]==1 && fake::calls["Clear"]==2 && fake::shadowDraws==6);   // map started only once
     // an opaque caster after the first transparent one is added to both maps
     fake::shadowDraws=0; fake::castFbos.clear(); useProgramDetour(7); drawElementsDetour(4,6,0x1403,nullptr);
-    CHECK(fake::shadowDraws==2 && fake::castFbos[0]==(int)st.sh.fbo[st.sh.write] && fake::castFbos[1]==(int)st.sh.allFbo[st.sh.write]);
+    CHECK(fake::shadowDraws==6 && fake::castFbos[0]==(int)st.sh.fbo[st.sh.write] && fake::castFbos[3]==(int)st.sh.allFbo[st.sh.write]);
     CHECK(fake::blendOn==1);
     // next frame: opaque caster first -> only the opaque map until a transparent one shows up
     { endFrame(st); }
     CHECK(st.sh.readValid && st.sh.allReadValid);
     fake::shadowDraws=0; fake::castFbos.clear(); drawElementsDetour(4,6,0x1403,nullptr);
-    CHECK(fake::shadowDraws==1 && fake::castFbos[0]==(int)st.sh.fbo[st.sh.write]);
+    CHECK(fake::shadowDraws==3 && fake::castFbos[0]==(int)st.sh.fbo[st.sh.write]);
     // receiver program: reads last frame's three maps, game's bindings are restored
     const int rd=st.sh.write^1; (void)rd;
     useProgramDetour(9); fake::calls.clear(); drawElementsDetour(4,6,0x1403,nullptr);
@@ -266,17 +266,17 @@ int main(){
       if(layoutA){ fake::modelM[12]=x; fake::modelM[13]=y; fake::modelM[14]=z; } else { fake::modelM[3]=x; fake::modelM[7]=y; fake::modelM[11]=z; } };
     useProgramDetour(10);
     auto drawn=[&]{ fake::shadowDraws=0; drawElementsDetour(4,6,0x1403,nullptr); return fake::shadowDraws; };
-    setT(0,0,0,true);        CHECK(drawn()==1);   // chunk at the camera is cast
-    setT(32,-16,-32,true);   CHECK(drawn()==1);   // inside the 64 block map
+    setT(0,0,0,true);        CHECK(drawn()==3);   // chunk at the camera is cast
+    setT(32,-16,-32,true);   CHECK(drawn()==3);   // inside the 64 block map
     setT(0,0,200,true);      CHECK(drawn()==0);   // far outside in light-space "right"
     setT(-200,0,0,true);     CHECK(drawn()==0);   // far outside in light-space "up"
-    setT(0,300,0,true);      CHECK(drawn()==1);   // far above only: stays (height is along the sun, handled by depth clipping)
+    setT(0,300,0,true);      CHECK(drawn()==3);   // far above only: stays (height is along the sun, handled by depth clipping)
     setT(0,0,200,false);     CHECK(drawn()==0);   // other matrix layout, same result
-    setT(0,0,0,false);       CHECK(drawn()==1);
-    fake::modelM[0]=0.0625f; setT(0,0,200,true); fake::modelM[0]=0.0625f; CHECK(drawn()==1);   // scaled matrix: not understood, never culled
-    fake::modelM[0]=1.0f; fake::modelM[12]=0; fake::modelM[13]=0; fake::modelM[14]=200; fake::modelM[3]=5.0f; CHECK(drawn()==1);   // both layouts nonzero: never culled
+    setT(0,0,0,false);       CHECK(drawn()==3);
+    fake::modelM[0]=0.0625f; setT(0,0,200,true); fake::modelM[0]=0.0625f; CHECK(drawn()==3);   // scaled matrix: not understood, never culled
+    fake::modelM[0]=1.0f; fake::modelM[12]=0; fake::modelM[13]=0; fake::modelM[14]=200; fake::modelM[3]=5.0f; CHECK(drawn()==3);   // both layouts nonzero: never culled
     { State& st=state(); endFrame(st); }
-    fake::cullZ=0.0f; setT(0,0,200,true); CHECK(drawn()==1);   // z = 0 turns culling off (new frame re-reads the uniform)
+    fake::cullZ=0.0f; setT(0,0,200,true); CHECK(drawn()==3);   // z = 0 turns culling off (new frame re-reads the uniform)
     // an instanced draw is never culled
     fake::cullZ=1.0f; { State& st=state(); endFrame(st); } setT(0,0,200,true);
     fake::shadowDraws=0; fake::calls.clear(); drawElementsInstancedDetour(4,6,0x1403,nullptr,4); CHECK(fake::calls["GetUniformfv"]<=1);

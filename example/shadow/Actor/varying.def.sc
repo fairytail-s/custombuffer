@@ -18,6 +18,6 @@ vec4 v_fog : COLOR2;
 vec4 v_light : COLOR3;
 centroid vec2 v_texcoord0 : TEXCOORD0;
 
-vec4 v_shadow : COLOR1;
+vec4 v_shadow : TEXCOORD4;
 vec3 v_sun : TEXCOORD3;      // direction to the sun (or moon)
 vec3 v_normal : TEXCOORD2;   // world-space normal
