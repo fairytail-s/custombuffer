@@ -9,8 +9,8 @@ uniform vec4 ShadowTransparentPass;
 uniform vec4 ShadowRes;
 uniform vec4 ShadowCull;
 
-#define SHADOW_RADIUS_NEAR 16.0
-#define SHADOW_RADIUS_MID  48.0
+#define SHADOW_RADIUS_NEAR 36.0
+#define SHADOW_RADIUS_MID  72.0
 #define SHADOW_RADIUS      ShadowCull.x
 #define SHADOW_DEPTH_RANGE ShadowCull.y
 #define SHADOW_BRIGHTNESS  0.55
@@ -118,7 +118,7 @@ highp vec3 shadowLit(highp vec4 s, highp float ndl) {
   float texel1 = 2.0 * SHADOW_RADIUS_MID / SHADOW_RES;
   float texel2 = 2.0 * SHADOW_RADIUS / SHADOW_RES;
 
-  highp float slope = max(clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 5.0), 0.5);
+  highp float slope = clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 5.0);
   highp float z0 = s.z - (SHADOW_BIAS + texel0 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
   highp float z1 = s.z - (SHADOW_BIAS + texel1 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
   highp float z2 = s.z - (SHADOW_BIAS + texel2 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
@@ -141,20 +141,24 @@ highp vec3 shadowLit(highp vec4 s, highp float ndl) {
   highp float d1 = max(abs(p1.x), abs(p1.y));
   highp vec3 lit;
   if (d0 < 1.0) {
-    highp vec3 lit0 = sampleCascadePCF(uv0, z0, uvMin0, uvMax0);
-    if (d0 > 0.80) {
-      highp vec3 lit1 = sampleCascadePCF(uv1, z1, uvMin1, uvMax1);
-      lit = mix(lit0, lit1, smoothstep(0.80, 1.0, d0));
+    if (d0 > 0.85) {
+      highp float blend0 = smoothstep(0.85, 1.0, d0);
+      highp float zBlend0 = mix(z0, z1, blend0);
+      highp vec3 lit0 = sampleCascadePCF(uv0, zBlend0, uvMin0, uvMax0);
+      highp vec3 lit1 = sampleCascadePCF(uv1, zBlend0, uvMin1, uvMax1);
+      lit = mix(lit0, lit1, blend0);
     } else {
-      lit = lit0;
+      lit = sampleCascadePCF(uv0, z0, uvMin0, uvMax0);
     }
   } else if (d1 < 1.0) {
-    highp vec3 lit1 = sampleCascadePCF(uv1, z1, uvMin1, uvMax1);
-    if (d1 > 0.80) {
-      highp vec3 lit2 = sampleCascadePCF(uv2, z2, uvMin2, uvMax2);
-      lit = mix(lit1, lit2, smoothstep(0.80, 1.0, d1));
+    if (d1 > 0.85) {
+      highp float blend1 = smoothstep(0.85, 1.0, d1);
+      highp float zBlend1 = mix(z1, z2, blend1);
+      highp vec3 lit1 = sampleCascadePCF(uv1, zBlend1, uvMin1, uvMax1);
+      highp vec3 lit2 = sampleCascadePCF(uv2, zBlend1, uvMin2, uvMax2);
+      lit = mix(lit1, lit2, blend1);
     } else {
-      lit = lit1;
+      lit = sampleCascadePCF(uv1, z1, uvMin1, uvMax1);
     }
   } else {
     lit = sampleCascadePCF(uv2, z2, uvMin2, uvMax2);
