@@ -76,7 +76,7 @@ constexpr int kEglDraw = 0x3059;
 constexpr int kShadowSize = 1024;                 // default texels per side
 constexpr int kShadowSizeMin = 256, kShadowSizeMax = 4096;
 constexpr GLenum kShadowFormat = GL_DEPTH_COMPONENT16;   // default (ShadowRes.y unset / 0); ShadowRes.y = 24 or 32 picks DEPTH_COMPONENT24 / 32F
-constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 8.0f;  // slope-scaled depth bias while casting
+constexpr float kShadowPolySlope = 2.0f, kShadowPolyUnits = 4.0f;  // slope-scaled depth bias while casting
 constexpr int kTrackedUnits = 32;
 constexpr unsigned kRevalidateFrames = 60;
 constexpr unsigned kVerifyMask = 1023;

@@ -189,7 +189,7 @@ shimmer. The code shifts the map by `snap`, the camera's remainder within a texe
 sits on a whole texel in world space. Moving less than one texel changes nothing; crossing a texel boundary moves the
 whole map by exactly one texel.
 
-All cascades share the outer cascade's texel snap size (`2.0 * SHADOW_RADIUS / SHADOW_RES`). Because `SHADOW_RADIUS` (144 blocks) is an exact integer multiple of `SHADOW_RADIUS_MID` (48 blocks, 3×) and `SHADOW_RADIUS_NEAR` (16 blocks, 9×), snapping to the outer grid also snaps to exact integer multiples of Cascade 1 and Cascade 0 texels, eliminating shimmer across all three cascades simultaneously. Cascade coordinates derive directly by scaling without requiring fragment-stage camera uniforms:
+All cascades share the outer cascade's texel snap size (`2.0 * SHADOW_RADIUS / SHADOW_RES`). Because `SHADOW_RADIUS` (144 blocks) is an exact integer multiple of `SHADOW_RADIUS_MID` (72 blocks, 2x) and `SHADOW_RADIUS_NEAR` (36 blocks, 4x), snapping to the outer grid also snaps to exact integer multiples of Cascade 1 and Cascade 0 texels, eliminating shimmer across all three cascades simultaneously. Cascade coordinates derive directly by scaling without requiring fragment-stage camera uniforms:
 
 ```glsl
 highp vec2 p1 = p2 * (SHADOW_RADIUS / SHADOW_RADIUS_MID);
@@ -215,11 +215,11 @@ vec4 shadowReceiver(vec3 rel, vec3 L) {
 
 Following the industry standard used in Google Filament and modern game engines, Custom Buffers implements a **3-Cascade Shadow Map (CSM)** with a stabilized linear orthographic atlas:
 
-- **Cascade 0 (Near)**: Covers radius {\text{near}} = 16\text{ blocks}$ (\text{ m}$ diameter). At 1024 resolution, this yields **32 texels per block** (.1\text{ cm/texel}$), delivering razor-sharp contact shadows for the player, mobs, and immediate terrain.
-- **Cascade 1 (Mid)**: Covers radius {\text{mid}} = 48\text{ blocks}$ (\text{ m}$ diameter). At 1024 resolution, this yields **10.6 texels per block** (.4\text{ cm/texel}$), keeping structures and nearby terrain detailed.
-- **Cascade 2 (Far)**: Covers radius {\text{far}} = 144\text{ blocks}$ (\text{ m}$ diameter, 9 chunks). At 1024 resolution, this yields **3.5 texels per block** (.1\text{ cm/texel}$), providing broad shadow coverage across the entire landscape.
-- **Shadow Atlas Layout**: The depth texture has dimensions  \times 1024$ (width  \times S$, height $). Cascade 0 occupies the left tile ( \in [0.0, 1/3]$), Cascade 1 occupies the middle tile ( \in [1/3, 2/3]$), and Cascade 2 occupies the right tile ( \in [2/3, 1.0]$).
-- **Seamless Blending**: Across cascade boundaries ( \in [0.80, 1.0]$ and  \in [0.80, 1.0]$), the receiver smoothly blends between adjacent cascades using smoothstep(0.80, 1.0, d), eliminating seams while sampling only the required cascade across 90% of screen pixels.
+- **Cascade 0 (Near)**: Covers radius 36 blocks (72 m diameter). At 1024 resolution, this yields **14.2 texels per block** (7.0 cm/texel), delivering crisp, stable contact shadows for the player, mobs, and surrounding landscape without placing seams in the immediate vicinity.
+- **Cascade 1 (Mid)**: Covers radius 72 blocks (144 m diameter). At 1024 resolution, this yields **7.1 texels per block** (14.1 cm/texel), keeping structures and nearby terrain detailed.
+- **Cascade 2 (Far)**: Covers radius 144 blocks (288 m diameter, 9 chunks). At 1024 resolution, this yields **3.55 texels per block** (28.1 cm/texel), providing broad shadow coverage across the entire landscape.
+- **Shadow Atlas Layout**: The depth texture has dimensions 3072 x 1024 (width 3 x S, height S). Cascade 0 occupies the left tile (u in [0.0, 1/3]), Cascade 1 occupies the middle tile (u in [1/3, 2/3]), and Cascade 2 occupies the right tile (u in [2/3, 1.0]).
+- **Seamless Blending**: Across cascade boundaries ($d_0 \in [0.85, 1.0]$ and $d_1 \in [0.85, 1.0]$), the receiver smoothly blends between adjacent cascades using `smoothstep(0.85, 1.0, d)`, eliminating seams while sampling only the required cascade across 90% of screen pixels.
 ---
 
 ## Reading the shadow map
@@ -242,15 +242,16 @@ Shadow mapping tests whether a surface point is behind the depth stored in the m
 the shadow map has finite resolution and precision, surface fragments can mistakenly self-shadow, creating striped
 artifacts known as "shadow acne".
 
-Custom Buffers uses **dynamic slope-scaled depth bias** proportional to each cascade's texel footprint with a stable constant floor:
+Custom Buffers uses **dynamic slope-scaled depth bias** proportional to each cascade's texel footprint:
 
-`glsl
-highp float slope = max(clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 5.0), 0.5);
+```glsl
+highp float slope = clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.1), 0.0, 5.0);
 highp float z0 = s.z - (SHADOW_BIAS + texel0 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
 highp float z1 = s.z - (SHADOW_BIAS + texel1 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
-`
+highp float z2 = s.z - (SHADOW_BIAS + texel2 * slope * SHADOW_SLOPE_BIAS) / (2.0 * SHADOW_DEPTH_RANGE);
+```
 
-SHADOW_BIAS (0.14 blocks) provides a solid constant floor that safely covers the ~11 quantization levels of a 16-bit depth buffer over the 800-block depth range, while SHADOW_SLOPE_BIAS (2.0) with a 0.5 floor scales with each cascade's texel size to prevent acne and periodic line artifacts even at exact noon ($ndl = 1.0$).
+`SHADOW_BIAS` (0.14 blocks) provides a solid constant floor that safely covers the ~11 quantization levels of a 16-bit depth buffer over the 800-block depth range, while `SHADOW_SLOPE_BIAS` (2.0) scales with each cascade's texel size on sloped terrain, preventing acne without causing Peter-panning or detached contact shadows on flat ground at noon ($ndl = 1.0$).
 
 ---
 
@@ -381,8 +382,9 @@ In `Actor/fragment.sc`, the normal is passed directly into `shadowLit()`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `SHADOW_RADIUS_NEAR` | 16.0 | Near cascade radius in blocks (Cascade 0). |
-| `SHADOW_RADIUS` | `ShadowCull.x` (64) | Far cascade radius in blocks (Cascade 1). |
+| `SHADOW_RADIUS_NEAR` | 36.0 | Near cascade radius in blocks (Cascade 0). |
+| `SHADOW_RADIUS_MID` | 72.0 | Mid cascade radius in blocks (Cascade 1). |
+| `SHADOW_RADIUS` | `ShadowCull.x` (144) | Far cascade radius in blocks (Cascade 2). |
 | `SHADOW_DEPTH_RANGE` | `ShadowCull.y` (400) | Blocks along `L`. |
 | `SHADOW_RES` | `ShadowRes.x` | Map resolution per cascade (uniform, default 1024). |
 | `SHADOW_BRIGHTNESS` | 0.55 | Brightness inside shadow. |
